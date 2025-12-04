@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 import stealth_requests as requests
 import requests as rq
 import yaml
-from bottle import Bottle, request, response, static_file
+from bottle import Bottle, request, response, static_file, redirect, abort
 from bs4 import BeautifulSoup
 from discord_webhook import DiscordWebhook
 from yattag import indent
@@ -236,9 +236,12 @@ class Story:
         video_links = []
         for attachment_set in Jq.all(post_json, 'attachment'):
             try:
-                link = ReelsParser.get_video_link(None, user_node=attachment_set)
-                if link not in video_links:
-                    video_links.append(link)
+                # links = ReelsParser.get_video_link(None, user_node=attachment_set)
+                # Adjusted to handle multiple links from ReelsParser
+                links = ReelsParser.get_video_links(None, user_node=attachment_set)
+                for link in links:
+                    if link not in video_links:
+                        video_links.append(link)
             except FacebedException:
                 pass
 
@@ -285,6 +288,7 @@ class ParsedPost:
     comments: str
     shares: str
     video_links: list[str]
+    id: str = ''
 
 
 def banned(url: str) -> ParsedPost:
@@ -456,26 +460,50 @@ class SinglePhotoParser:
 
 class ReelsParser:
     @staticmethod
-    def get_video_link(html_parser: BeautifulSoup|None, user_node: dict = None) -> str:
-        def work_node(node: dict) -> str:
-            video_node = Jq.first(node, 'videoDeliveryLegacyFields')
-            for key in ['browser_native_hd_url', 'browser_native_sd_url']:
-                try:
-                    video_link = Jq.first(video_node, key)
-                    if not video_link:
-                        continue
-                    return str(video_link)
-                except StopIteration:
-                    pass
-            raise FacebedException('Invalid reels link (vn)')
+    def get_video_links(html_parser: BeautifulSoup|None, user_node: dict = None) -> list[str]:
+        links = []
+        def work_node(node: dict):
+            try:
+                video_node = Jq.first(node, 'videoDeliveryLegacyFields')
+                # Try to get both HD and SD links
+                for key in ['browser_native_hd_url', 'browser_native_sd_url']:
+                    try:
+                        video_link = Jq.first(video_node, key)
+                        if video_link:
+                            links.append(str(video_link))
+                    except StopIteration:
+                        pass
+            except StopIteration:
+                pass
+            
+            # Fallback for some video types if videoDeliveryLegacyFields is missing/empty but keys exist elsewhere
+            if not links:
+                for key in ['browser_native_hd_url', 'browser_native_sd_url']:
+                    try:
+                        video_link = Jq.first(node, key)
+                        if video_link:
+                            links.append(str(video_link))
+                    except StopIteration:
+                        pass
 
         if user_node:
-            return work_node(user_node)
+            work_node(user_node)
+            if links:
+                return links
+            # Adhere to original exception behavior if strict parsing needed, or could return empty
+            raise FacebedException('Invalid reels link (vn)')
 
         # randomly breaks if sorted
+        found = False
         for json_block in JsonParser.get_json_blocks(html_parser, sort=False):
             if 'browser_native_hd_url' in json_block or 'browser_native_sd_url' in json_block:
-                return work_node(json.loads(json_block))
+                work_node(json.loads(json_block))
+                if links:
+                    found = True
+                    break
+        
+        if found:
+            return links
 
         raise FacebedException('Invalid reels link (vn)')
 
@@ -522,7 +550,7 @@ class ReelsParser:
         html_parser = BeautifulSoup(http_response.text, 'html.parser')
         content_node = ReelsParser.get_content_node(html_parser)
 
-        video_link = ReelsParser.get_video_link(html_parser)
+        video_links = ReelsParser.get_video_links(html_parser)
         video_id = content_node['id']
         owner_info = content_node['short_form_video_context']['video_owner']
         is_ig = owner_info['__typename'].startswith('InstagramUser')
@@ -536,7 +564,7 @@ class ReelsParser:
         if owner_info['id'] in config['banned_users']:
             return banned(post_url)
 
-        return ParsedPost(op_name, post_text, [], post_url, post_date, likes, cmts, shares, [video_link])
+        return ParsedPost(op_name, post_text, [], post_url, post_date, likes, cmts, shares, video_links, id=video_id)
 
 
 class VideoWatchParser:
@@ -572,7 +600,9 @@ class VideoWatchParser:
         html_parser = BeautifulSoup(http_response.text, 'html.parser')
         content_node = VideoWatchParser.get_content_node(html_parser)
 
-        video_link = ReelsParser.get_video_link(html_parser)
+        video_links = ReelsParser.get_video_links(html_parser)
+        # Try to extract an ID from the content node if possible
+        video_id = content_node.get('id', '')
 
         post_url = JsonParser.ensure_full_url(post_path)
         op_name = VideoWatchParser.get_op_name(html_parser)
@@ -582,7 +612,7 @@ class VideoWatchParser:
         cmts = Utils.human_format(content_node['feedback']['total_comment_count'])
         post_date = VideoWatchParser.get_date(html_parser)
 
-        return ParsedPost(op_name, post_text, [], post_url, post_date, likes, cmts, shares, [video_link])
+        return ParsedPost(op_name, post_text, [], post_url, post_date, likes, cmts, shares, video_links, id=video_id)
 
 
 def format_error_message_embed(original_url: str) -> str:
@@ -621,7 +651,14 @@ def format_reel_post_embed(post: ParsedPost) -> str:
             f'<meta property="og:video:secure_url" content="{link}"/>'
         ])
 
-    video_meta_tags = '\n'.join([get_video_meta_tag(vu) for vu in post.video_links])
+    # If we have an ID, construct the proxy URL
+    video_links_to_use = post.video_links
+    if post.id and request.urlparts:
+        # e.g. https://facebed.com/generate/video/123456.mp4
+        proxied_url = f"{request.urlparts.scheme}://{request.get_header('host')}/generate/video/{post.id}.mp4"
+        video_links_to_use = [proxied_url]
+
+    video_meta_tags = '\n'.join([get_video_meta_tag(vu) for vu in video_links_to_use])
     reaction_str = Utils.format_reactions_str(post.likes, post.comments, post.shares)
     post_date = Utils.timestamp_to_str(post.date)
     color = '#0866ff'
@@ -635,6 +672,7 @@ def format_reel_post_embed(post: ParsedPost) -> str:
             <meta property="og:description" content="{escape(post.text[:1024])}"/>
             <meta property="og:site_name" content="{get_credit()}\n{post_date}\n{reaction_str}"/>
             <meta property="og:url" content="{quote(post.url)}"/>
+            <meta property="og:type" content="video.other"/>
             <meta property="og:video:type" content="video/mp4"/>
             <meta property="twitter:player:stream:content_type" content="video/mp4"/>
 
@@ -690,6 +728,66 @@ def process_single_photo(post_path: str) -> str:
     if type(parsed_post) == ParsedPost:
         return format_full_post_embed(parsed_post)
     return format_error_message_embed(f'{WWWFB}/{post_path}')
+
+
+@app.route('/generate/video/<video_id>.mp4')
+def generate_video(video_id: str):
+    hq = request.query.get('hq') == 'true' or request.query.get('quality') == 'hq'
+    user_agent = request.headers.get('User-Agent', '')
+    is_telegram_bot = 'TelegramBot' in user_agent
+
+    try:
+        # Reconstruct a reel URL to use the existing parser to get links
+        parsed_post = ReelsParser.process_post(f'reel/{video_id}')
+        
+        if not parsed_post.video_links:
+            abort(404, "No video links found")
+
+        play_url = None
+
+        if hq:
+            # If HQ requested, try to use the first link (usually HD if available)
+            play_url = parsed_post.video_links[0]
+        elif is_telegram_bot:
+            # Telegram logic: find the best video under 20MB
+            MAX_SIZE = 20971520 # 20MB
+            valid_candidates = []
+            
+            # Check size of each link using HEAD request
+            # We use standard requests (rq) here as it's faster for simple HEAD checks
+            for link in parsed_post.video_links:
+                try:
+                    head_resp = rq.head(link, timeout=5)
+                    size = int(head_resp.headers.get('Content-Length', 0))
+                    if 0 < size <= MAX_SIZE:
+                        valid_candidates.append({'link': link, 'size': size})
+                except Exception:
+                    continue
+            
+            if valid_candidates:
+                # Pick the largest one that fits
+                valid_candidates.sort(key=lambda x: x['size'], reverse=True)
+                play_url = valid_candidates[0]['link']
+            else:
+                # Fallback: use the last link (usually SD) if no size info matches or available
+                play_url = parsed_post.video_links[-1]
+        else:
+             # Default behavior: use the first available link
+             play_url = parsed_post.video_links[0]
+
+        if not play_url:
+            abort(404, "Could not find suitable play URL")
+
+        # Manual redirect handling
+        r = rq.get(play_url, allow_redirects=False, stream=True)
+        if r.status_code in [301, 302] and 'Location' in r.headers:
+            return redirect(r.headers['Location'])
+        else:
+            return redirect(play_url)
+
+    except Exception:
+        print(traceback.format_exc())
+        abort(404, "Error generating video")
 
 
 @app.route('/<path:path>')
