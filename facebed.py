@@ -702,6 +702,9 @@ def index(path: str):
 
     if 'type' in request.query.dict and '3' in request.query.dict['type']:
         return format_error_message_embed(f'{WWWFB}/{path}')
+    
+    if re.match('(discordbot|telegrambot|facebook|whatsapp|vkshare|revoltchat|preview|iframely)', request.headers.get('User-Agent')) == None:
+        return format_error_message_embed(f'{WWWFB}/{path}')
 
     try:
         if re.match('^(/)?share/v/.*', path):
