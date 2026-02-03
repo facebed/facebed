@@ -34,6 +34,13 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
 
+      - name: Write last_commit.yml
+        run: |
+          rm last_commit.yml
+          touch last_commit.yml
+          echo date: \'$(git log -1 --format=%cd)\' >> last_commit.yml
+          echo date: \'$(git rev-parse HEAD)\' >> last_commit.yml
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
