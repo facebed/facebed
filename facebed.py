@@ -12,17 +12,20 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 from typing import Self, Callable
-from urllib.parse import quote as _quote_
+from urllib.parse import quote_plus
 from html import escape
 from urllib.parse import urlparse
 
 import stealth_requests as requests
 import requests as rq
 import yaml
-from bottle import Bottle, request, response, static_file
+from bottle import Bottle, request, response, static_file, redirect
 from bs4 import BeautifulSoup
 from discord_webhook import DiscordWebhook
 from yattag import indent
+
+with open('last_commit.yml', 'r', encoding='utf-8') as f:
+    last_commit = yaml.safe_load(f)
 
 CONFIG_STR = '''
 host: 0.0.0.0
@@ -41,12 +44,6 @@ TZ_OFFSET: int = 0
 ALLOW_UPDATE = True
 logging.basicConfig(format='[%(levelname)s] [%(asctime)s] %(msg)s', level=logging.INFO)
 
-
-def quote(s: str) -> str:
-    return "".join([
-        _quote_(char) if char in r"<>\"'#%{}[]|\\^~`" else char
-        for char in s
-    ])
 
 def get_credit() -> str:
     return 'facebed by pi.kt'
@@ -97,7 +94,7 @@ class Utils:
 
     @staticmethod
     def human_format(num):
-        if type(num) == int or re.match('^[0-9]+$', str(num)):
+        if type(num) == int or re.search(r'^[0-9]+$', str(num)):
             num = int(num)
             num = float('{:.3g}'.format(num))
             magnitude = 0
@@ -590,15 +587,17 @@ class VideoWatchParser:
 
 def format_error_message_embed(original_url: str) -> str:
     return Utils.prettify(f'''<!DOCTYPE html>
-<html lang="">
-<head>
-<meta charset="UTF-8" />
-    <meta name="theme-color" content="#2c3048f" />
-    <meta property="og:title" content="Log in or sign up to view"/>
-    <meta property="og:description" content="See posts, photos and more on Facebook.\nIf viewable in incognito report to git.facebed.com."/>
-    <meta http-equiv="refresh" content="0;url={quote(original_url)}"/>
-</head>
-</html>''')
+        <html lang="">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="theme-color" content="#2c3048f">
+            <meta property="og:title" content="Log in or sign up to view">
+            <meta property="og:description" content="See posts, photos and more on Facebook.\nIf viewable in incognito report to git.facebed.com.">
+            <meta http-equiv="refresh" content="0; url={escape(original_url)}">
+            <!-- Last Commit Date: {last_commit['date']} -->
+            <!-- Last Commit Hash: {last_commit['hash']} -->
+        </head>
+        </html>''')
 
 
 def is_facebook_url(url: str) -> bool:
@@ -607,10 +606,10 @@ def is_facebook_url(url: str) -> bool:
     full_url = f'{wwwfb}{url}'
     parsed_url = urlparse(full_url)
 
-    is_group_post = re.match(f'^/groups/{username_pattern}', parsed_url.path)
+    is_group_post = re.search(f'^/groups/{username_pattern}', parsed_url.path)
     is_permalink = parsed_url.path.startswith('/permalink.php')
     is_story = parsed_url.path.startswith('/story.php')
-    is_post = re.match(f'/{username_pattern}/posts', parsed_url.path)
+    is_post = re.search(f'^/{username_pattern}/posts', parsed_url.path)
     is_photo = parsed_url.path.startswith('/photo')
 
     return is_permalink or is_post or is_story or is_photo or is_group_post
@@ -619,9 +618,9 @@ def is_facebook_url(url: str) -> bool:
 def format_reel_post_embed(post: ParsedPost) -> str:
     def get_video_meta_tag(link: str) -> str:
         return '\n'.join([
-            f'<meta property="twitter:player:stream" content="{link}"/>',
-            f'<meta property="og:video" content="{link}"/>'
-            f'<meta property="og:video:secure_url" content="{link}"/>'
+            f'<meta property="twitter:player:stream" content="{escape(link)}">',
+            f'<meta property="og:video" content="{escape(link)}">'
+            f'<meta property="og:video:secure_url" content="{escape(link)}">'
         ])
 
     video_meta_tags = '\n'.join([get_video_meta_tag(vu) for vu in post.video_links])
@@ -629,24 +628,30 @@ def format_reel_post_embed(post: ParsedPost) -> str:
     post_date = Utils.timestamp_to_str(post.date)
     color = '#0866ff'
 
+    post_stats = f'{get_credit()}\n{post_date}\n{reaction_str}'
+    oembed_url = f'/oembed.json?post_stats={quote_plus(post_stats)}&author_name={quote_plus(post.author_name)}&author_url={quote_plus(post.url)}'
+
     return Utils.prettify(f'''<!DOCTYPE html>
         <html lang="">
         <head>
-            <title>{get_credit()}</title>
-            <meta charset="UTF-8"/>
-            <meta property="og:title" content="{escape(post.author_name)}"/>
-            <meta property="og:description" content="{escape(post.text[:1024])}"/>
-            <meta property="og:site_name" content="{get_credit()}\n{post_date}\n{reaction_str}"/>
-            <meta property="og:url" content="{quote(post.url)}"/>
-            <meta property="og:video:type" content="video/mp4"/>
-            <meta property="twitter:player:stream:content_type" content="video/mp4"/>
+            <title>{escape(get_credit())}</title>
+            <meta charset="UTF-8">
+            <meta property="og:title" content="{escape(post.author_name)}">
+            <meta property="og:description" content="{escape(post.text[:1024])}">
+            <meta property="og:site_name" content="{escape(post_stats)}">
+            <meta property="og:url" content="{escape(post.url)}">
+            <meta property="og:video:type" content="video/mp4">
+            <meta property="twitter:player:stream:content_type" content="video/mp4">
 
             {video_meta_tags}
 
-            <link rel="canonical" href="{quote(post.url)}"/>
-            <meta http-equiv="refresh" content="0;url={quote(post.url)}"/>
-            <meta name="twitter:card" content="player"/>
-            <meta name="theme-color" content="{color}"/>
+            <link rel="canonical" href="{escape(post.url)}">
+            <link rel="alternate" type="application/json+oembed" href="{escape(oembed_url)}">
+            <meta http-equiv="refresh" content="0; url={escape(post.url)}">
+            <meta name="twitter:card" content="player">
+            <meta name="theme-color" content="{color}">
+            <!-- Last Commit Date: {last_commit['date']} -->
+            <!-- Last Commit Hash: {last_commit['hash']} -->
         </head>
         </html>''')
 
@@ -657,25 +662,31 @@ def format_full_post_embed(post: ParsedPost) -> str:
     image_links = post.image_links
     image_counter = f'\ncontains 4+ images' if len(image_links) > 4 else ''
     image_links = image_links[:4]
-    image_meta_tags = '\n'.join([f'<meta property="og:image" content="{iu}"/>' for iu in image_links])
+    image_meta_tags = '\n'.join([f'<meta property="og:image" content="{escape(iu)}">' for iu in image_links])
     post_date = Utils.timestamp_to_str(post.date)
     reaction_str = Utils.format_reactions_str(post.likes, post.comments, post.shares)
+
+    post_stats = f'{get_credit()}\n{post_date}\n{reaction_str}{image_counter}'
+    oembed_url = f'/oembed.json?post_stats={quote_plus(post_stats)}&author_name={quote_plus(post.author_name)}&author_url={quote_plus(post.url)}'
 
     # TODO: organize and duplicate the neccessary tags
     return Utils.prettify(f'''<!DOCTYPE html>
         <html lang="">
         <head>
-            <title>{get_credit()}</title>
-            <meta charset="UTF-8"/>
-            <meta property="og:title" content="{escape(post.author_name)}"/>
-            <meta property="og:description" content="{escape(post.text[:1024])}"/>
-            <meta property="og:site_name" content="{get_credit()}\n{post_date}\n{reaction_str}{image_counter}"/>
-            <meta property="og:url" content="{quote(post.url)}"/>
+            <title>{escape(get_credit())}</title>
+            <meta charset="UTF-8">
+            <meta property="og:title" content="{escape(post.author_name)}">
+            <meta property="og:description" content="{escape(post.text[:1024])}">
+            <meta property="og:site_name" content="{escape(post_stats)}">
+            <meta property="og:url" content="{escape(post.url)}">
             {image_meta_tags}
-            <link rel="canonical" href="{quote(post.url)}"/>
-            <meta http-equiv="refresh" content="0;url={quote(post.url)}"/>
-            <meta name="twitter:card" content="summary_large_image"/>
-            <meta name="theme-color" content="#0866ff"/>
+            <link rel="canonical" href="{escape(post.url)}">
+            <link rel="alternate" type="application/json+oembed" href="{escape(oembed_url)}">
+            <meta http-equiv="refresh" content="0; url={escape(post.url)}">
+            <meta name="twitter:card" content="summary_large_image">
+            <meta name="theme-color" content="#0866ff">
+            <!-- Last Commit Date: {last_commit['date']} -->
+            <!-- Last Commit Hash: {last_commit['hash']} -->
         </head>
         </html>''')
 
@@ -695,24 +706,36 @@ def process_single_photo(post_path: str) -> str:
     return format_error_message_embed(f'{WWWFB}/{post_path}')
 
 
+@app.route('/oembed.json')
+def oembed():
+    return {
+        "version": "1.0",
+        "provider_name": request.query.post_stats,
+        "provider_url": "",
+        "title": "",
+        "author_name": request.query.author_name,
+        "author_url": request.query.author_url,
+    }
+
 @app.route('/<path:path>')
 def index(path: str):
     if request.query_string:
         path += f'?{request.query_string}'
+    
+    userAgent = request.headers.get('User-Agent', default='')
+    if re.search(r'discordbot|telegrambot|facebook|whatsapp|vkshare|revoltchat|preview|iframely', userAgent, flags=re.IGNORECASE) == None:
+        return redirect(f'{WWWFB}/{path}')
 
     if 'type' in request.query.dict and '3' in request.query.dict['type']:
         return format_error_message_embed(f'{WWWFB}/{path}')
-    
-    if re.match('(discordbot|telegrambot|facebook|whatsapp|vkshare|revoltchat|preview|iframely)', request.headers.get('User-Agent')) == None:
-        return format_error_message_embed(f'{WWWFB}/{path}')
 
     try:
-        if re.match('^(/)?share/v/.*', path):
+        if re.search(r'^(/)?share/v/.*', path):
             path = Utils.resolve_share_link(path)
             if not path:
                 return format_error_message_embed(f'{WWWFB}/{path}')
 
-        if re.match('^(/)?share/([pr]/)?[a-zA-Z0-9-._]*(/)?', path):
+        if re.search(r'^(/)?share/([pr]/)?[a-zA-Z0-9-._]*(/)?', path):
             path = Utils.resolve_share_link(path)
             if not path:
                 return format_error_message_embed(f'{WWWFB}/{path}')
@@ -722,13 +745,13 @@ def index(path: str):
             video_id = search.group(1)
             path = f'reel/{video_id}'
 
-        if re.match(f'^/?reel/[0-9]+', path):
+        if re.search(r'^/?reel/[0-9]+', path):
             return format_reel_post_embed(ReelsParser.process_post(path))
 
-        if re.match('^/*photo(\\.php)*/*$', urlparse(path).path):
+        if re.search(r'^/*photo(\.php)*/*$', urlparse(path).path):
             return process_single_photo(path)
 
-        if re.match('^/*watch', urlparse(path).path):
+        if re.search(r'^/*watch', urlparse(path).path):
             return format_reel_post_embed(VideoWatchParser.process_post(path))
 
         if is_facebook_url(path):
