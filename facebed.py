@@ -14,7 +14,7 @@ from functools import wraps
 from typing import Self, Callable
 from urllib.parse import quote_plus
 from html import escape
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import stealth_requests as requests
 import requests as rq
@@ -625,7 +625,8 @@ def is_facebook_url(url: str) -> bool:
     return is_permalink or is_post or is_story or is_photo or is_group_post
 
 def make_oembed_url(post_stats: str, author_name: str, author_url: str) -> str:
-    return f'/oembed.json?post_stats={quote_plus(post_stats)}&author_name={quote_plus(author_name)}&author_url={quote_plus(author_url)}'
+    base_url = urljoin(request.url, '/')
+    return f'{base_url}oembed.json?post_stats={quote_plus(post_stats)}&author_name={quote_plus(author_name)}&author_url={quote_plus(author_url)}'
 
 def format_reel_post_embed(post: ParsedPost) -> str:
     def get_video_meta_tag(link: str) -> str:
@@ -648,7 +649,7 @@ def format_reel_post_embed(post: ParsedPost) -> str:
         <head>
             <title>{escape(get_credit())}</title>
             <meta charset="UTF-8">
-            <meta property="og:title" content="{escape(post.author_name)}">
+            <!-- <meta property="og:title" content="{escape(post.author_name)}"> -->
             <meta property="og:description" content="{escape(post.text[:1024])}">
             <meta property="og:site_name" content="{escape(post_stats)}">
             <meta property="og:url" content="{escape(post.url)}">
@@ -687,7 +688,7 @@ def format_full_post_embed(post: ParsedPost) -> str:
         <head>
             <title>{escape(get_credit())}</title>
             <meta charset="UTF-8">
-            <meta property="og:title" content="{escape(post.author_name)}">
+            <!-- <meta property="og:title" content="{escape(post.author_name)}"> -->
             <meta property="og:description" content="{escape(post.text[:1024])}">
             <meta property="og:site_name" content="{escape(post_stats)}">
             <meta property="og:url" content="{escape(post.url)}">
