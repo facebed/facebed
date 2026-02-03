@@ -24,6 +24,17 @@ from bs4 import BeautifulSoup
 from discord_webhook import DiscordWebhook
 from yattag import indent
 
+PLAIN_NUMBER_REGEX = re.compile(r'^[0-9]+$')
+BOT_USER_AGENT_REGEX = re.compile(r'discordbot|telegrambot|facebook|whatsapp|vkshare|revoltchat|preview|iframely', flags=re.IGNORECASE)
+SHARE_V_LINK = re.compile(r'^(/)?share/v/.*')
+SHARE_PR_LINK = re.compile(r'^(/)?share/([pr]/)?[a-zA-Z0-9-._]*(/)?')
+VIDEO_LINK = re.compile(r'/videos/(\d+).*')
+REEL_LINK = re.compile(r'^/?reel/[0-9]+')
+PHOTO_LINK = re.compile(r'^/*photo(\.php)*/*$')
+WATCH_LINK = re.compile(r'^/*watch')
+GROUP_LINK = re.compile(r'^/groups/[a-zA-Z0-9-._]*')
+POST_LINK = re.compile(r'^/[a-zA-Z0-9-._]*/posts')
+
 with open('last_commit.yml', 'r', encoding='utf-8') as f:
     last_commit = yaml.safe_load(f)
 
@@ -94,7 +105,7 @@ class Utils:
 
     @staticmethod
     def human_format(num):
-        if type(num) == int or re.search(r'^[0-9]+$', str(num)):
+        if type(num) == int or PLAIN_NUMBER_REGEX.search(str(num)):
             num = int(num)
             num = float('{:.3g}'.format(num))
             magnitude = 0
@@ -602,18 +613,19 @@ def format_error_message_embed(original_url: str) -> str:
 
 def is_facebook_url(url: str) -> bool:
     wwwfb = f'{WWWFB}/'
-    username_pattern = '[a-zA-Z0-9-._]*'  # also covers /watch
     full_url = f'{wwwfb}{url}'
     parsed_url = urlparse(full_url)
 
-    is_group_post = re.search(f'^/groups/{username_pattern}', parsed_url.path)
+    is_group_post = GROUP_LINK.search(parsed_url.path)
     is_permalink = parsed_url.path.startswith('/permalink.php')
     is_story = parsed_url.path.startswith('/story.php')
-    is_post = re.search(f'^/{username_pattern}/posts', parsed_url.path)
+    is_post = POST_LINK.search(parsed_url.path)
     is_photo = parsed_url.path.startswith('/photo')
 
     return is_permalink or is_post or is_story or is_photo or is_group_post
 
+def make_oembed_url(post_stats: str, author_name: str, author_url: str) -> str:
+    return f'/oembed.json?post_stats={quote_plus(post_stats)}&author_name={quote_plus(author_name)}&author_url={quote_plus(author_url)}'
 
 def format_reel_post_embed(post: ParsedPost) -> str:
     def get_video_meta_tag(link: str) -> str:
@@ -629,7 +641,7 @@ def format_reel_post_embed(post: ParsedPost) -> str:
     color = '#0866ff'
 
     post_stats = f'{get_credit()}\n{post_date}\n{reaction_str}'
-    oembed_url = f'/oembed.json?post_stats={quote_plus(post_stats)}&author_name={quote_plus(post.author_name)}&author_url={quote_plus(post.url)}'
+    oembed_url = make_oembed_url(post_stats, post.author_name, post.url)
 
     return Utils.prettify(f'''<!DOCTYPE html>
         <html lang="">
@@ -667,7 +679,7 @@ def format_full_post_embed(post: ParsedPost) -> str:
     reaction_str = Utils.format_reactions_str(post.likes, post.comments, post.shares)
 
     post_stats = f'{get_credit()}\n{post_date}\n{reaction_str}{image_counter}'
-    oembed_url = f'/oembed.json?post_stats={quote_plus(post_stats)}&author_name={quote_plus(post.author_name)}&author_url={quote_plus(post.url)}'
+    oembed_url = make_oembed_url(post_stats, post.author_name, post.url)
 
     # TODO: organize and duplicate the neccessary tags
     return Utils.prettify(f'''<!DOCTYPE html>
@@ -723,35 +735,35 @@ def index(path: str):
         path += f'?{request.query_string}'
     
     userAgent = request.headers.get('User-Agent', default='')
-    if re.search(r'discordbot|telegrambot|facebook|whatsapp|vkshare|revoltchat|preview|iframely', userAgent, flags=re.IGNORECASE) == None:
+    if BOT_USER_AGENT_REGEX.search(userAgent) == None:
         return redirect(f'{WWWFB}/{path}')
 
     if 'type' in request.query.dict and '3' in request.query.dict['type']:
         return format_error_message_embed(f'{WWWFB}/{path}')
 
     try:
-        if re.search(r'^(/)?share/v/.*', path):
+        if SHARE_V_LINK.search(path):
             path = Utils.resolve_share_link(path)
             if not path:
                 return format_error_message_embed(f'{WWWFB}/{path}')
 
-        if re.search(r'^(/)?share/([pr]/)?[a-zA-Z0-9-._]*(/)?', path):
+        if SHARE_PR_LINK.search(path):
             path = Utils.resolve_share_link(path)
             if not path:
                 return format_error_message_embed(f'{WWWFB}/{path}')
 
-        search = re.search(r'/videos/(\d+).*', path)
+        search = VIDEO_LINK.search(path)
         if search:
             video_id = search.group(1)
             path = f'reel/{video_id}'
 
-        if re.search(r'^/?reel/[0-9]+', path):
+        if REEL_LINK.search(path):
             return format_reel_post_embed(ReelsParser.process_post(path))
 
-        if re.search(r'^/*photo(\.php)*/*$', urlparse(path).path):
+        if PHOTO_LINK.search(urlparse(path).path):
             return process_single_photo(path)
 
-        if re.search(r'^/*watch', urlparse(path).path):
+        if WATCH_LINK.search(urlparse(path).path):
             return format_reel_post_embed(VideoWatchParser.process_post(path))
 
         if is_facebook_url(path):
