@@ -306,6 +306,14 @@ class FacebedException(Exception):
     pass
 
 
+class NoDataException(FacebedException):
+    pass
+
+
+class ParseException(FacebedException):
+    pass
+
+
 class JsonParser:
     @staticmethod
     def get_headers() -> dict:
@@ -330,11 +338,40 @@ class JsonParser:
         return [json.loads(e.text) for e in script_elements]
 
     @staticmethod
+    def probe_page_type(html_parser: BeautifulSoup) -> str:
+        blocks = JsonParser.get_json_blocks(html_parser, sort=False)
+
+        has_login_preloader = False
+        has_post_data = False
+
+        for bloc in blocks:
+            if not has_login_preloader:
+                if isinstance(Jq.first(bloc, 'login_data'), dict):
+                    has_login_preloader = True
+                elif any(obj.get('queryName') == 'useCometLogInFormQuery' for obj in Jq.enumerate(bloc)):
+                    has_login_preloader = True
+            if Jq.has(bloc, 'i18n_reaction_count'):
+                has_post_data = True
+                break
+
+        if has_post_data:
+            return 'has_data'
+        if has_login_preloader:
+            return 'login_wall'
+        return 'unknown'
+
+    @staticmethod
+    def check_page_or_raise(html_parser: BeautifulSoup, post_path: str):
+        page_type = JsonParser.probe_page_type(html_parser)
+        if page_type == 'login_wall':
+            raise NoDataException(f'Facebook served a login wall for {post_path} - content requires authentication')
+
+    @staticmethod
     def get_post_json(html_parser: BeautifulSoup) -> dict:
         for bloc in JsonParser.get_json_blocks(html_parser):
             if Jq.has(bloc, 'i18n_reaction_count') :  # TODO: add more robust detection
                 return bloc
-        raise FacebedException('cannot find post json')
+        raise ParseException('cannot find post json')
 
     @staticmethod
     def get_group_name(html_parser: BeautifulSoup) -> str:
@@ -385,7 +422,7 @@ class JsonParser:
                 continue
 
 
-        raise FacebedException('Cannot process post')
+        raise ParseException('Cannot process post')
 
     @staticmethod
     def ensure_full_url(u: str) -> str:
@@ -399,6 +436,7 @@ class JsonParser:
         http_response = requests.get(JsonParser.ensure_full_url(post_path),
                                      headers=JsonParser.get_headers(), cookies=acc.get_cookies())
         html_parser = BeautifulSoup(http_response.text, 'html.parser')
+        JsonParser.check_page_or_raise(html_parser, post_path)
 
         post_json = JsonParser.get_root_node(JsonParser.get_post_json(html_parser))
         likes, cmts, shares = JsonParser.get_interaction_counts(post_json)
@@ -427,27 +465,28 @@ class SinglePhotoParser:
         for bloc in JsonParser.get_json_blocks(html_parser):
             if Jq.has(bloc, 'message_preferred_body', 'container_story'):
                 return Jq.first(bloc, 'data')
-        raise FacebedException('Cannot process post (cn)')
+        raise ParseException('Cannot process post (cn)')
 
     @staticmethod
     def get_interactions_node(html_parser: BeautifulSoup) -> dict:
         for bloc in JsonParser.get_json_blocks(html_parser):
             if Jq.has(bloc, 'comet_ufi_summary_and_actions_renderer'):
                 return bloc
-        raise FacebedException('Cannot process post (in)')
+        raise ParseException('Cannot process post (in)')
 
     @staticmethod
     def get_single_image(html_parser: BeautifulSoup) -> str:
         for bloc in JsonParser.get_json_blocks(html_parser):
             if Jq.has(bloc, 'prefetch_uris_v2'):
                 return str(Jq.first(bloc, 'prefetch_uris_v2')[0]['uri'])
-        raise FacebedException('cannot find single image')
+        raise ParseException('cannot find single image')
 
     @staticmethod
     def process_post(post_path: str) -> ParsedPost:
         http_response = requests.get(JsonParser.ensure_full_url(post_path),
                                      headers=JsonParser.get_headers(), cookies=acc.get_cookies())
         html_parser = BeautifulSoup(http_response.text, 'html.parser')
+        JsonParser.check_page_or_raise(html_parser, post_path)
         content_node = SinglePhotoParser.get_content_node(html_parser)
         interaction_node = SinglePhotoParser.get_interactions_node(html_parser)
 
@@ -467,14 +506,14 @@ class PhotocomParser:
         for bloc in JsonParser.get_json_blocks(html_parser):
             if Jq.has(bloc, 'attached_comment') and not Jq.has(bloc, 'unified_reactors'):
                 return Jq.first(bloc, 'result')
-        raise FacebedException('Cannot process photocom (cn)')
+        raise ParseException('Cannot process photocom (cn)')
 
     @staticmethod
     def get_reaction_count(html_parser: BeautifulSoup) -> int:
         for bloc in JsonParser.get_json_blocks(html_parser):
             if Jq.has(bloc, 'attached_comment', 'unified_reactors'):
                 return Jq.first(bloc, 'unified_reactors')['count']
-        raise FacebedException('Cannot process photocom (rc)')
+        raise ParseException('Cannot process photocom (rc)')
 
     @staticmethod
     def get_attached_image_and_url(html_parser: BeautifulSoup) -> tuple[str, str]:
@@ -482,13 +521,14 @@ class PhotocomParser:
             if Jq.has(bloc, 'attached_comment', 'unified_reactors'):
                 cur = Jq.first(bloc, 'currMedia')
                 return str(cur['image']['uri']), str(cur['attached_comment']['feedback']['url'])
-        raise FacebedException('Cannot process photocom (iau)')
+        raise ParseException('Cannot process photocom (iau)')
 
     @staticmethod
     def process_post(post_path: str) -> ParsedPost:
         http_response = requests.get(JsonParser.ensure_full_url(post_path),
                                      headers=JsonParser.get_headers(), cookies=acc.get_cookies())
         html_parser = BeautifulSoup(http_response.text, 'html.parser')
+        JsonParser.check_page_or_raise(html_parser, post_path)
         content_node = PhotocomParser.get_content_node(html_parser)
         body = content_node['data']['attached_comment']['preferred_body']
 
@@ -514,7 +554,7 @@ class ReelsParser:
                     return str(video_link)
                 except StopIteration:
                     pass
-            raise FacebedException('Invalid reels link (vn)')
+            raise ParseException('Invalid reels link (vn)')
 
         if user_node:
             return work_node(user_node)
@@ -524,7 +564,7 @@ class ReelsParser:
             if Jq.has(bloc, 'browser_native_hd_url') or Jq.has(bloc, 'browser_native_sd_url'):
                 return work_node(bloc)
 
-        raise FacebedException('Invalid reels link (vn)')
+        raise ParseException('Invalid reels link (vn)')
 
 
     @staticmethod
@@ -532,7 +572,7 @@ class ReelsParser:
         for bloc in JsonParser.get_json_blocks(html_parser):
             if Jq.has(bloc, 'browser_native_sd_url', 'creation_story'):
                 return Jq.first(bloc, 'creation_story')
-        raise FacebedException('Invalid reels link (cn)')
+        raise ParseException('Invalid reels link (cn)')
 
 
     @staticmethod
@@ -544,7 +584,7 @@ class ReelsParser:
                     blocks.append(bloc)
 
         if len(blocks) == 0:
-            raise FacebedException('Cannot process post (cn)')
+            raise ParseException('Cannot process post (cn)')
 
         # assuming the last one contains ig info
         bloc = blocks[0]
@@ -567,6 +607,7 @@ class ReelsParser:
         http_response = requests.get(JsonParser.ensure_full_url(post_path),
                                      headers=JsonParser.get_headers())
         html_parser = BeautifulSoup(http_response.text, 'html.parser')
+        JsonParser.check_page_or_raise(html_parser, post_path)
         content_node = ReelsParser.get_content_node(html_parser)
 
         video_link = ReelsParser.get_video_link(html_parser)
@@ -593,7 +634,7 @@ class VideoWatchParser:
         for bloc in JsonParser.get_json_blocks(html_parser, sort=False):
             if Jq.has(bloc, 'is_additional_profile_plus'):
                 return Jq.first(bloc, 'owner')['name']
-        raise FacebedException('Invalid watch link (opn)')
+        raise ParseException('Invalid watch link (opn)')
 
 
     @staticmethod
@@ -601,7 +642,7 @@ class VideoWatchParser:
         for bloc in JsonParser.get_json_blocks(html_parser):
             if Jq.has(bloc,'comment_rendering_instance', 'video_view_count_renderer'):
                 return Jq.first(bloc, 'result')['data']
-        raise FacebedException('Invalid watch link (cn)')
+        raise ParseException('Invalid watch link (cn)')
 
     @staticmethod
     def get_date(html_parser: BeautifulSoup) -> int:
@@ -609,13 +650,14 @@ class VideoWatchParser:
             if 'creation_time' in json_block:
                 #   noinspection PyTypeChecker
                 return int(Jq.first(json.loads(json_block), 'creation_time'))
-        raise FacebedException('cannot find date')
+        raise ParseException('cannot find date')
 
     @staticmethod
     def process_post(post_path: str) -> ParsedPost:
         http_response = requests.get(JsonParser.ensure_full_url(post_path),
                                      headers=JsonParser.get_headers(), cookies=acc.get_cookies())
         html_parser = BeautifulSoup(http_response.text, 'html.parser')
+        JsonParser.check_page_or_raise(html_parser, post_path)
         content_node = VideoWatchParser.get_content_node(html_parser)
 
         video_link = ReelsParser.get_video_link(html_parser)
@@ -631,14 +673,15 @@ class VideoWatchParser:
         return ParsedPost(op_name, post_text, [], post_url, post_date, likes, cmts, shares, [video_link])
 
 
-def format_error_message_embed(original_url: str) -> str:
+def format_error_message_embed(original_url: str, error_code: str = '') -> str:
+    code_suffix = f' [{error_code}]' if error_code else ''
     return Utils.prettify(f'''<!DOCTYPE html>
 <html lang="">
 <head>
 <meta charset="UTF-8" />
     <meta name="theme-color" content="#2c3048f" />
-    <meta property="og:title" content="Log in or sign up to view"/>
-    <meta property="og:description" content="See posts, photos and more on Facebook.\nIf viewable in incognito report to git.facebed.com."/>
+    <meta property="og:title" content="Log in or sign up to view{code_suffix}"/>
+    <meta property="og:description" content="See posts, photos and more on Facebook.\nIf viewable in incognito report to git.facebed.com"/>
     <meta http-equiv="refresh" content="0;url={quote(original_url)}"/>
 </head>
 </html>''')
@@ -773,12 +816,12 @@ def index(path: str):
         if re.match('^(/)?share/v/.*', path):
             path = Utils.resolve_share_link(path)
             if not path:
-                return format_error_message_embed(f'{WWWFB}/{path}')
+                return format_error_message_embed(f'{WWWFB}/{path}', 'C')
 
         if re.match('^(/)?share/([pr]/)?[a-zA-Z0-9-._]*(/)?', path):
             path = Utils.resolve_share_link(path)
             if not path:
-                return format_error_message_embed(f'{WWWFB}/{path}')
+                return format_error_message_embed(f'{WWWFB}/{path}', 'C')
 
         search = re.search(r'/videos/(\d+).*', path)
         if search:
@@ -797,15 +840,21 @@ def index(path: str):
         if is_facebook_url(path):
             return process_post(path)
         else:
-            return format_error_message_embed('https://git.facebed.com')
+            return format_error_message_embed('https://git.facebed.com', 'C')
 
 
+    except NoDataException:
+        logging.info(f'No data available for /{path} (login wall / restricted content)')
+        return format_error_message_embed(f'{WWWFB}/{path}', 'C')
+    except ParseException:
+        logging.error(f'Parser bug for /{path}:\n{traceback.format_exc()}')
+        return format_error_message_embed(f'{WWWFB}/{path}', 'P')
     except FacebedException:
-        print(traceback.format_exc())
-        return format_error_message_embed(f'{WWWFB}/{path}')
+        logging.warning(f'Unclassified FacebedException for /{path}:\n{traceback.format_exc()}')
+        return format_error_message_embed(f'{WWWFB}/{path}', 'U')
     except Exception:
-        print(traceback.format_exc())
-        return format_error_message_embed(f'{WWWFB}/{path}')
+        logging.error(f'Unexpected error for /{path}:\n{traceback.format_exc()}')
+        return format_error_message_embed(f'{WWWFB}/{path}', 'X')
 
 
 @app.route('/favicon.ico')
