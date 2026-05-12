@@ -10,6 +10,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
+from contextlib import contextmanager
 from functools import wraps
 from html import escape
 from typing import Self, Callable
@@ -30,7 +31,7 @@ host: 0.0.0.0
 port: 9812
 timezone: 7
 banned_users: []
-banned_notifier_webhook: ''
+notifier_webhook: ''
 '''.strip()
 
 config: dict = {}
@@ -70,13 +71,15 @@ class Utils:
         return indent(txt, indentation ='    ', newline = '\n', indent_text = True)
 
     @staticmethod
-    def warn(msg: str):
+    def warn(msg: str, file_content: bytes = None, filename: str = None):
         def worker():
-            wh = config['banned_notifier_webhook']
+            wh = config['notifier_webhook']
             if not wh or not wh.startswith('https://discord.com/api/webhooks/'):
                 return
             try:
-                webhook = DiscordWebhook(url=config['banned_notifier_webhook'], content=msg)
+                webhook = DiscordWebhook(url=config['notifier_webhook'], content=msg)
+                if file_content and filename:
+                    webhook.add_file(file=file_content, filename=filename)
                 webhook.execute()
             except Exception:
                 logging.warning(f'failed to warn about "{msg}"')
@@ -311,7 +314,10 @@ class NoDataException(FacebedException):
 
 
 class ParseException(FacebedException):
-    pass
+    def __init__(self, message: str, html: str = '', url: str = ''):
+        super().__init__(message)
+        self.html = html
+        self.url = url
 
 
 class JsonParser:
@@ -365,6 +371,25 @@ class JsonParser:
         page_type = JsonParser.probe_page_type(html_parser)
         if page_type == 'login_wall':
             raise NoDataException(f'Facebook served a login wall for {post_path} - content requires authentication')
+
+    @staticmethod
+    @contextmanager
+    def fetch_page(post_path: str, use_cookies=False):
+        url = JsonParser.ensure_full_url(post_path)
+        kw = {'headers': JsonParser.get_headers()}
+        if use_cookies:
+            kw['cookies'] = acc.get_cookies()
+        http_response = requests.get(url, **kw)
+        raw_html = http_response.text
+        html_parser = BeautifulSoup(raw_html, 'html.parser')
+        JsonParser.check_page_or_raise(html_parser, post_path)
+        try:
+            yield html_parser
+        except ParseException as e:
+            if not e.html:
+                e.html = raw_html
+                e.url = url
+            raise
 
     @staticmethod
     def get_post_json(html_parser: BeautifulSoup) -> dict:
@@ -433,30 +458,26 @@ class JsonParser:
 
     @staticmethod
     def process_post(post_path: str) -> ParsedPost:
-        http_response = requests.get(JsonParser.ensure_full_url(post_path),
-                                     headers=JsonParser.get_headers(), cookies=acc.get_cookies())
-        html_parser = BeautifulSoup(http_response.text, 'html.parser')
-        JsonParser.check_page_or_raise(html_parser, post_path)
+        with JsonParser.fetch_page(post_path) as html_parser:
+            post_json = JsonParser.get_root_node(JsonParser.get_post_json(html_parser))
+            likes, cmts, shares = JsonParser.get_interaction_counts(post_json)
+            # noinspection PyTypeChecker
+            post_date = int(Jq.first(post_json['context_layout']['story']['comet_sections']['metadata'], 'creation_time'))
+            post_json = post_json['content']['story']
 
-        post_json = JsonParser.get_root_node(JsonParser.get_post_json(html_parser))
-        likes, cmts, shares = JsonParser.get_interaction_counts(post_json)
-        # noinspection PyTypeChecker
-        post_date = int(Jq.first(post_json['context_layout']['story']['comet_sections']['metadata'], 'creation_time'))
-        post_json = post_json['content']['story']
+            story = Story(post_json)
+            post_url = story.url
+            post_content = story.get_text()
+            post_group_name = JsonParser.get_group_name(html_parser)
+            post_author_name = story.author_name
+            link_header = f'{post_author_name}' + (f' • {post_group_name}' if post_group_name else '')
 
-        story = Story(post_json)
-        post_url = story.url
-        post_content = story.get_text()
-        post_group_name = JsonParser.get_group_name(html_parser)
-        post_author_name = story.author_name
-        link_header = f'{post_author_name}' + (f' • {post_group_name}' if post_group_name else '')
+            if story.author_id in config['banned_users']:
+                return banned(post_url)
 
-        if story.author_id in config['banned_users']:
-            return banned(post_url)
-
-        # TODO: support normal /watch here
-        return ParsedPost(link_header, post_content.strip(), story.image_links, post_url, post_date,
-                          likes, cmts, shares, story.video_links)
+            # TODO: support normal /watch here
+            return ParsedPost(link_header, post_content.strip(), story.image_links, post_url, post_date,
+                              likes, cmts, shares, story.video_links)
 
 
 class SinglePhotoParser:
@@ -483,21 +504,18 @@ class SinglePhotoParser:
 
     @staticmethod
     def process_post(post_path: str) -> ParsedPost:
-        http_response = requests.get(JsonParser.ensure_full_url(post_path),
-                                     headers=JsonParser.get_headers(), cookies=acc.get_cookies())
-        html_parser = BeautifulSoup(http_response.text, 'html.parser')
-        JsonParser.check_page_or_raise(html_parser, post_path)
-        content_node = SinglePhotoParser.get_content_node(html_parser)
-        interaction_node = SinglePhotoParser.get_interactions_node(html_parser)
+        with JsonParser.fetch_page(post_path) as html_parser:
+            content_node = SinglePhotoParser.get_content_node(html_parser)
+            interaction_node = SinglePhotoParser.get_interactions_node(html_parser)
 
-        post_text = content_node['message']['text'] if content_node['message'] and 'text' in content_node['message'] else ''
-        post_author = content_node['owner']['name']
-        post_date = content_node['created_time']
-        likes, cmts, shares = JsonParser.get_interaction_counts(interaction_node)
-        image_url = SinglePhotoParser.get_single_image(html_parser)
+            post_text = content_node['message']['text'] if content_node['message'] and 'text' in content_node['message'] else ''
+            post_author = content_node['owner']['name']
+            post_date = content_node['created_time']
+            likes, cmts, shares = JsonParser.get_interaction_counts(interaction_node)
+            image_url = SinglePhotoParser.get_single_image(html_parser)
 
-        return ParsedPost(post_author, post_text.strip(), [image_url], JsonParser.ensure_full_url(post_path),
-                          post_date, likes, cmts, shares, [])\
+            return ParsedPost(post_author, post_text.strip(), [image_url], JsonParser.ensure_full_url(post_path),
+                              post_date, likes, cmts, shares, [])
 
 
 class PhotocomParser:
@@ -525,20 +543,17 @@ class PhotocomParser:
 
     @staticmethod
     def process_post(post_path: str) -> ParsedPost:
-        http_response = requests.get(JsonParser.ensure_full_url(post_path),
-                                     headers=JsonParser.get_headers(), cookies=acc.get_cookies())
-        html_parser = BeautifulSoup(http_response.text, 'html.parser')
-        JsonParser.check_page_or_raise(html_parser, post_path)
-        content_node = PhotocomParser.get_content_node(html_parser)
-        body = content_node['data']['attached_comment']['preferred_body']
+        with JsonParser.fetch_page(post_path) as html_parser:
+            content_node = PhotocomParser.get_content_node(html_parser)
+            body = content_node['data']['attached_comment']['preferred_body']
 
-        op_name = content_node['data']['owner']['name'] + ' (💬)'
-        post_text = '' if body is None else body['text']
-        post_time = content_node['data']['created_time']
-        post_image, post_url = PhotocomParser.get_attached_image_and_url(html_parser)
-        reaction_count = PhotocomParser.get_reaction_count(html_parser)
+            op_name = content_node['data']['owner']['name'] + ' (💬)'
+            post_text = '' if body is None else body['text']
+            post_time = content_node['data']['created_time']
+            post_image, post_url = PhotocomParser.get_attached_image_and_url(html_parser)
+            reaction_count = PhotocomParser.get_reaction_count(html_parser)
 
-        return ParsedPost(op_name, post_text, [post_image], post_url, post_time, Utils.human_format(reaction_count), 'null', 'null', [])
+            return ParsedPost(op_name, post_text, [post_image], post_url, post_time, Utils.human_format(reaction_count), 'null', 'null', [])
 
 
 class ReelsParser:
@@ -604,27 +619,24 @@ class ReelsParser:
 
     @staticmethod
     def process_post(post_path: str) -> ParsedPost:
-        http_response = requests.get(JsonParser.ensure_full_url(post_path),
-                                     headers=JsonParser.get_headers())
-        html_parser = BeautifulSoup(http_response.text, 'html.parser')
-        JsonParser.check_page_or_raise(html_parser, post_path)
-        content_node = ReelsParser.get_content_node(html_parser)
+        with JsonParser.fetch_page(post_path, use_cookies=False) as html_parser:
+            content_node = ReelsParser.get_content_node(html_parser)
 
-        video_link = ReelsParser.get_video_link(html_parser)
-        video_id = content_node['id']
-        owner_info = content_node['short_form_video_context']['video_owner']
-        is_ig = owner_info['__typename'].startswith('InstagramUser')
-        op_name = ('📷 @' if is_ig else '') + owner_info['username' if is_ig else 'name']
-        post_url = content_node['short_form_video_context']['shareable_url']
-        post_date = content_node['creation_time']
-        post_text = '' if content_node['message'] is None else content_node['message']['text']
+            video_link = ReelsParser.get_video_link(html_parser)
+            video_id = content_node['id']
+            owner_info = content_node['short_form_video_context']['video_owner']
+            is_ig = owner_info['__typename'].startswith('InstagramUser')
+            op_name = ('📷 @' if is_ig else '') + owner_info['username' if is_ig else 'name']
+            post_url = content_node['short_form_video_context']['shareable_url']
+            post_date = content_node['creation_time']
+            post_text = '' if content_node['message'] is None else content_node['message']['text']
 
-        likes, cmts, shares = ReelsParser.get_reaction_counts(html_parser, is_ig, video_id)
+            likes, cmts, shares = ReelsParser.get_reaction_counts(html_parser, is_ig, video_id)
 
-        if owner_info['id'] in config['banned_users']:
-            return banned(post_url)
+            if owner_info['id'] in config['banned_users']:
+                return banned(post_url)
 
-        return ParsedPost(op_name, post_text, [], post_url, post_date, likes, cmts, shares, [video_link])
+            return ParsedPost(op_name, post_text, [], post_url, post_date, likes, cmts, shares, [video_link])
 
 
 class VideoWatchParser:
@@ -649,28 +661,25 @@ class VideoWatchParser:
         for json_block in JsonParser.get_json_blocks(html_parser):
             if 'creation_time' in json_block:
                 #   noinspection PyTypeChecker
-                return int(Jq.first(json.loads(json_block), 'creation_time'))
+                return int(Jq.first(json_block, 'creation_time'))
         raise ParseException('cannot find date')
 
     @staticmethod
     def process_post(post_path: str) -> ParsedPost:
-        http_response = requests.get(JsonParser.ensure_full_url(post_path),
-                                     headers=JsonParser.get_headers(), cookies=acc.get_cookies())
-        html_parser = BeautifulSoup(http_response.text, 'html.parser')
-        JsonParser.check_page_or_raise(html_parser, post_path)
-        content_node = VideoWatchParser.get_content_node(html_parser)
+        with JsonParser.fetch_page(post_path) as html_parser:
+            content_node = VideoWatchParser.get_content_node(html_parser)
 
-        video_link = ReelsParser.get_video_link(html_parser)
+            video_link = ReelsParser.get_video_link(html_parser)
 
-        post_url = JsonParser.ensure_full_url(post_path)
-        op_name = VideoWatchParser.get_op_name(html_parser)
-        post_text = content_node['title']['text'] if content_node['title'] else ''
-        likes = Utils.human_format(content_node['feedback']['reaction_count']['count'])
-        shares = 'null'
-        cmts = Utils.human_format(content_node['feedback']['total_comment_count'])
-        post_date = VideoWatchParser.get_date(html_parser)
+            post_url = JsonParser.ensure_full_url(post_path)
+            op_name = VideoWatchParser.get_op_name(html_parser)
+            post_text = content_node['title']['text'] if content_node['title'] else ''
+            likes = Utils.human_format(content_node['feedback']['reaction_count']['count'])
+            shares = 'null'
+            cmts = Utils.human_format(content_node['feedback']['total_comment_count'])
+            post_date = VideoWatchParser.get_date(html_parser)
 
-        return ParsedPost(op_name, post_text, [], post_url, post_date, likes, cmts, shares, [video_link])
+            return ParsedPost(op_name, post_text, [], post_url, post_date, likes, cmts, shares, [video_link])
 
 
 def format_error_message_embed(original_url: str, error_code: str = '') -> str:
@@ -846,8 +855,15 @@ def index(path: str):
     except NoDataException:
         logging.info(f'No data available for /{path} (login wall / restricted content)')
         return format_error_message_embed(f'{WWWFB}/{path}', 'C')
-    except ParseException:
+    except ParseException as e:
         logging.error(f'Parser bug for /{path}:\n{traceback.format_exc()}')
+        page_url = e.url or f'{WWWFB}/{path}'
+        msg = f'🚨 **ParseException** for `{path}`\n{page_url}\n`{e}`'
+        if e.html:
+            filename = re.sub(r'[^a-zA-Z0-9]', '_', path)[:80] + '.html'
+            Utils.warn(msg, file_content=e.html.encode('utf-8'), filename=filename)
+        else:
+            Utils.warn(msg)
         return format_error_message_embed(f'{WWWFB}/{path}', 'P')
     except FacebedException:
         logging.warning(f'Unclassified FacebedException for /{path}:\n{traceback.format_exc()}')
@@ -864,7 +880,7 @@ def favicon():
 
 
 @app.route('/banner.png')
-def favicon():
+def banner():
     response.content_type = 'image/png'
     return static_file('banner.png', root='./assets')
 
