@@ -345,6 +345,13 @@ class JsonParser:
 
     @staticmethod
     def probe_page_type(html_parser: BeautifulSoup) -> str:
+        canonical = html_parser.find('link', attrs={'rel': 'canonical'})
+        if canonical and re.search(r'/login\b', canonical.get('href', '')):
+            return 'login_wall'
+        meta_refresh = html_parser.find('meta', attrs={'http-equiv': 'refresh'})
+        if meta_refresh and re.search(r'URL\s*=\s*/login[/?]', meta_refresh.get('content', ''), re.IGNORECASE):
+            return 'login_wall'
+
         blocks = JsonParser.get_json_blocks(html_parser, sort=False)
 
         has_login_preloader = False
@@ -646,6 +653,10 @@ class VideoWatchParser:
         for bloc in JsonParser.get_json_blocks(html_parser, sort=False):
             if Jq.has(bloc, 'is_additional_profile_plus'):
                 return Jq.first(bloc, 'owner')['name']
+        for bloc in JsonParser.get_json_blocks(html_parser, sort=False):
+            owner = Jq.first(bloc, 'owner')
+            if isinstance(owner, dict) and 'name' in owner:
+                return owner['name']
         raise ParseException('Invalid watch link (opn)')
 
 
@@ -654,12 +665,15 @@ class VideoWatchParser:
         for bloc in JsonParser.get_json_blocks(html_parser):
             if Jq.has(bloc,'comment_rendering_instance', 'video_view_count_renderer'):
                 return Jq.first(bloc, 'result')['data']
+        canonical = html_parser.find('link', attrs={'rel': 'canonical'})
+        if canonical and re.match(r'https?://[^/]+/watch/?$', canonical.get('href', '')):
+            raise NoDataException('Facebook served generic watch feed instead of specific video')
         raise ParseException('Invalid watch link (cn)')
 
     @staticmethod
     def get_date(html_parser: BeautifulSoup) -> int:
         for json_block in JsonParser.get_json_blocks(html_parser):
-            if 'creation_time' in json_block:
+            if Jq.has(json_block, 'creation_time'):
                 #   noinspection PyTypeChecker
                 return int(Jq.first(json_block, 'creation_time'))
         raise ParseException('cannot find date')

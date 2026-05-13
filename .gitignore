@@ -166,3 +166,8 @@ debug.*
 cookies.txt
 cookies.json
 samples
+jk
+test*
+TEST*
+*.md
+*.json
