@@ -23,7 +23,7 @@ import stealth_requests as requests
 import yaml
 from bottle import Bottle, request, response, static_file
 from bs4 import BeautifulSoup
-from discord_webhook import DiscordWebhook
+from discord_webhook import DiscordWebhook, DiscordEmbed
 from yattag import indent
 
 CONFIG_STR = '''
@@ -57,32 +57,38 @@ def get_credit() -> str:
 class Utils:
     @staticmethod
     def resolve_share_link(path: str) -> str:
-        # cookies not needed to resolve share links
-        head_request = rq.head(f'{WWWFB}/{path}', headers=JsonParser.get_headers())
-        if head_request.next is None or head_request.next.url.startswith('https://www.facebook.com/share'):
+        url = f'{WWWFB}/{path}'
+        logging.info(f'Resolving share link: {url}')
+        head_request = rq.head(url, headers=JsonParser.get_headers(), allow_redirects=True)
+        logging.info(f'Resolved to: {head_request.url}')
+        if head_request.url.startswith(('https://www.facebook.com/share', 'https://web.facebook.com/share')):
+            logging.warning('Share link still redirects to share page')
             return ''
-        path = head_request.next.url.removeprefix(f'{WWWFB}/')
-        # print(path)
-        return path
-
+        
+        for base in ['https://www.facebook.com', 'https://web.facebook.com']:
+            if head_request.url.startswith(f'{base}/'):
+                return head_request.url.removeprefix(f'{base}/')
+        return head_request.url
 
     @staticmethod
     def prettify(txt: str) -> str:
         return indent(txt, indentation ='    ', newline = '\n', indent_text = True)
 
     @staticmethod
-    def warn(msg: str, file_content: bytes = None, filename: str = None):
+    def warn(msg: str = None, file_content: bytes = None, filename: str = None, embed: DiscordEmbed = None):
         def worker():
             wh = config['notifier_webhook']
             if not wh or not wh.startswith('https://discord.com/api/webhooks/'):
                 return
             try:
                 webhook = DiscordWebhook(url=config['notifier_webhook'], content=msg)
+                if embed:
+                    webhook.add_embed(embed)
                 if file_content and filename:
                     webhook.add_file(file=file_content, filename=filename)
                 webhook.execute()
             except Exception:
-                logging.warning(f'failed to warn about "{msg}"')
+                logging.warning(f'failed to warn about "{msg or embed}"')
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -174,7 +180,12 @@ class Jq:
     @staticmethod
     def has(obj: dict, *args: str) -> bool:
         for k in args:
-            if not Jq.first(obj, k):
+            found = False
+            for oo in Jq.enumerate(obj):
+                if k in oo:
+                    found = True
+                    break
+            if not found:
                 return False
         return True
 
@@ -222,12 +233,32 @@ class Story:
     attached_story: Self
 
     def __init__(self, story_json: dict):
-        self.author_name = story_json['actors'][0]['name']
-        self.text = story_json['message']['text'] if (story_json['message'] and 'text' in story_json['message']) else ''
+        self.author_name = ''
+        if 'actors' in story_json and story_json['actors'] and isinstance(story_json['actors'], list) and len(story_json['actors']) > 0 and 'name' in story_json['actors'][0]:
+            self.author_name = story_json['actors'][0]['name']
+        else:
+            self.author_name = Jq.first(story_json, 'name')
+            if not self.author_name or not isinstance(self.author_name, str):
+                self.author_name = Jq.first(story_json, 'localized_name') or ''
+
+        self.text = ''
+        if 'message' in story_json and story_json['message'] and 'text' in story_json['message']:
+            self.text = story_json['message']['text']
+        else:
+            self.text = Jq.first(story_json, 'text') or ''
+
         self.image_links = self.get_image_links_post_json(story_json)
         self.video_links = self.get_video_links(story_json)
-        self.url = story_json['wwwURL']
-        self.author_id = story_json['actors'][0]['id']
+        
+        self.url = story_json.get('wwwURL') or Jq.first(story_json, 'url') or ''
+        if not isinstance(self.url, str):
+            self.url = ''
+
+        self.author_id = ''
+        if 'actors' in story_json and story_json['actors'] and isinstance(story_json['actors'], list) and len(story_json['actors']) > 0 and 'id' in story_json['actors'][0]:
+            self.author_id = story_json['actors'][0]['id']
+        else:
+            self.author_id = Jq.first(story_json, 'id') or ''
 
         if 'attached_story' in story_json and story_json['attached_story'] and 'actors' in story_json['attached_story']:
             self.attached_story = Story(story_json['attached_story'])
@@ -335,57 +366,54 @@ class JsonParser:
 
         return headers
 
-
     @staticmethod
     def get_json_blocks(html_parser: BeautifulSoup, sort=True) -> list[dict]:
-        script_elements = html_parser.find_all('script', attrs={'type': 'application/json', 'data-content-len': True, 'data-sjs': True})
-        if sort:
-            script_elements.sort(key=lambda e: int(e.attrs['data-content-len']), reverse=True)
-        return [json.loads(e.text) for e in script_elements]
+        script_elements = html_parser.find_all('script', attrs={'type': 'application/json'})
+        
+        data_blocks = []
+        for e in script_elements:
+            try:
+                if e.text:
+                    data = json.loads(e.text)
+                    data_blocks.append(data)
+            except json.JSONDecodeError:
+                continue
+        return data_blocks
 
     @staticmethod
     def probe_page_type(html_parser: BeautifulSoup) -> str:
+        blocks = JsonParser.get_json_blocks(html_parser, sort=False)
+        
+        has_post_data = False
+        for bloc in blocks:
+            if Jq.has(bloc, 'i18n_reaction_count') or Jq.has(bloc, 'short_form_video_context'):
+                has_post_data = True
+                break
+        
+        if has_post_data:
+            return 'has_data'
+            
         canonical = html_parser.find('link', attrs={'rel': 'canonical'})
         if canonical and re.search(r'/login\b', canonical.get('href', '')):
             return 'login_wall'
-        meta_refresh = html_parser.find('meta', attrs={'http-equiv': 'refresh'})
-        if meta_refresh and re.search(r'URL\s*=\s*/login[/?]', meta_refresh.get('content', ''), re.IGNORECASE):
-            return 'login_wall'
-
-        blocks = JsonParser.get_json_blocks(html_parser, sort=False)
-
-        has_login_preloader = False
-        has_post_data = False
-
-        for bloc in blocks:
-            if not has_login_preloader:
-                if isinstance(Jq.first(bloc, 'login_data'), dict):
-                    has_login_preloader = True
-                elif any(obj.get('queryName') == 'useCometLogInFormQuery' for obj in Jq.enumerate(bloc)):
-                    has_login_preloader = True
-            if Jq.has(bloc, 'i18n_reaction_count'):
-                has_post_data = True
-                break
-
-        if has_post_data:
-            return 'has_data'
-        if has_login_preloader:
-            return 'login_wall'
-        return 'unknown'
+        
+        return 'no_data'
 
     @staticmethod
     def check_page_or_raise(html_parser: BeautifulSoup, post_path: str):
         page_type = JsonParser.probe_page_type(html_parser)
-        if page_type == 'login_wall':
-            raise NoDataException(f'Facebook served a login wall for {post_path} - content requires authentication')
+        if page_type in ('login_wall', 'no_data'):
+            raise NoDataException(f'Facebook served a login wall or empty page for {post_path} - content requires authentication')
 
     @staticmethod
     @contextmanager
-    def fetch_page(post_path: str, use_cookies=False):
+    def fetch_page(post_path: str, use_cookies=True):
         url = JsonParser.ensure_full_url(post_path)
         kw = {'headers': JsonParser.get_headers()}
         if use_cookies:
-            kw['cookies'] = acc.get_cookies()
+            cookies = acc.get_cookies()
+            if cookies:
+                kw['cookies'] = cookies
         http_response = requests.get(url, **kw)
         raw_html = http_response.text
         html_parser = BeautifulSoup(raw_html, 'html.parser')
@@ -400,10 +428,35 @@ class JsonParser:
 
     @staticmethod
     def get_post_json(html_parser: BeautifulSoup) -> dict:
-        for bloc in JsonParser.get_json_blocks(html_parser):
-            if Jq.has(bloc, 'i18n_reaction_count') :  # TODO: add more robust detection
-                return bloc
-        raise ParseException('cannot find post json')
+        candidate_blocks = []
+        for bloc in JsonParser.get_json_blocks(html_parser, sort=False):
+            if Jq.has(bloc, 'i18n_reaction_count') or Jq.has(bloc, 'short_form_video_context'):
+                candidate_blocks.append(bloc)
+
+        if not candidate_blocks:
+            for bloc in JsonParser.get_json_blocks(html_parser, sort=False):
+                if 'video' in str(bloc) and 'short_form_video_context' in str(bloc):
+                    candidate_blocks.append(bloc)
+                    
+        if not candidate_blocks:
+            raise ParseException('cannot find post json')
+
+        def score_block(bloc: dict) -> int:
+            score = 0
+            if Jq.has(bloc, 'short_form_video_context'):
+                score += 20
+            if Jq.has(bloc, 'creation_story'):
+                score += 10
+            if Jq.has(bloc, 'comet_sections'):
+                score += 5
+            if Jq.has(bloc, 'group_hoisted_feed'):
+                score += 8
+            if Jq.has(bloc, 'video_home_www_related_videos_section') or Jq.has(bloc, 'video_home_www_loe_video_permalink_seo_info'):
+                score -= 20
+            return score
+
+        candidate_blocks.sort(key=score_block, reverse=True)
+        return candidate_blocks[0]
 
     @staticmethod
     def get_group_name(html_parser: BeautifulSoup) -> str:
@@ -417,29 +470,76 @@ class JsonParser:
     @staticmethod
     def get_interaction_counts(post_json: dict) -> tuple[str, str, str]:
         assert post_json
+        
         post_feedback = Jq.first(post_json, 'comet_ufi_summary_and_actions_renderer')
-        assert post_feedback
-        reactions = post_feedback['feedback']['i18n_reaction_count']
-        shares = post_feedback['feedback']['i18n_share_count']
-        comments = post_feedback['feedback']['comment_rendering_instance']['comments']['total_count']
+        if post_feedback and isinstance(post_feedback, dict) and 'feedback' in post_feedback:
+            fb = post_feedback['feedback']
+            reactions = fb.get('i18n_reaction_count') or Jq.first(fb, 'i18n_reaction_count') or '0'
+            shares = fb.get('i18n_share_count') or Jq.first(fb, 'i18n_share_count') or '0'
+            
+            comments = '0'
+            if 'comment_rendering_instance' in fb and isinstance(fb['comment_rendering_instance'], dict):
+                comments_node = fb['comment_rendering_instance'].get('comments')
+                if comments_node and isinstance(comments_node, dict):
+                    comments = str(comments_node.get('total_count', '0'))
+            if comments == '0':
+                comments = str(fb.get('total_comment_count') or Jq.first(fb, 'total_comment_count') or '0')
+                
+            return str(reactions), str(comments), str(shares)
+
+        fb = Jq.first(post_json, 'feedback')
+        if fb and isinstance(fb, dict):
+            reactions = fb.get('i18n_reaction_count') or Jq.first(fb, 'i18n_reaction_count') or '0'
+            shares = fb.get('i18n_share_count') or fb.get('share_count') or Jq.first(fb, 'i18n_share_count') or Jq.first(fb, 'share_count') or '0'
+            comments = fb.get('total_comment_count') or Jq.first(fb, 'total_comment_count')
+            if not comments:
+                if 'comment_rendering_instance' in fb and isinstance(fb['comment_rendering_instance'], dict):
+                    comments_node = fb['comment_rendering_instance'].get('comments')
+                    if comments_node and isinstance(comments_node, dict):
+                        comments = comments_node.get('total_count')
+            if not comments:
+                comments = '0'
+            return str(reactions), str(comments), str(shares)
+
+        reactions = Jq.first(post_json, 'i18n_reaction_count') or '0'
+        shares = Jq.first(post_json, 'i18n_share_count') or Jq.first(post_json, 'share_count') or '0'
+        comments = Jq.first(post_json, 'total_comment_count') or '0'
+        
         return str(reactions), str(comments), str(shares)
 
     @staticmethod
     def get_root_node(post_json: dict) -> dict:
         def work_normal_post() -> dict:
             data_blob = Jq.first(post_json, 'data')
+            if not isinstance(data_blob, dict):
+                short_form = Jq.first(post_json, 'short_form_video_context')
+                if short_form:
+                    return {'creation_story': short_form}
+                return {}
             if 'comet_ufi_summary_and_actions_renderer' in data_blob:   # single photo
                 return data_blob
-            elif 'node_v2' in data_blob:
+            elif 'node_v2' in data_blob and isinstance(data_blob['node_v2'], dict) and 'comet_sections' in data_blob['node_v2']:
                 return data_blob['node_v2']['comet_sections']
-            elif 'node' in data_blob:
+            elif 'node' in data_blob and isinstance(data_blob['node'], dict) and 'comet_sections' in data_blob['node']:
                 return data_blob['node']['comet_sections']
+            short_form = Jq.first(data_blob, 'short_form_video_context')
+            if short_form:
+                return {'creation_story': short_form}
             return {}
 
         def work_group_post() -> dict:
             hoisted_feed = Jq.first(post_json, 'group_hoisted_feed')
-            comet_section = Jq.first(hoisted_feed, 'comet_sections')
-            return comet_section
+            if isinstance(hoisted_feed, dict) and 'comet_sections' in hoisted_feed:
+                return hoisted_feed['comet_sections']
+            
+            data_blob = Jq.first(post_json, 'data')
+            if isinstance(data_blob, dict):
+                group = data_blob.get('group')
+                if isinstance(group, dict):
+                    comet_sections = Jq.first(group, 'comet_sections')
+                    if comet_sections:
+                        return comet_sections
+            return {}
 
         methods: list[Callable[[], dict]] = [work_normal_post, work_group_post]
 
@@ -453,6 +553,9 @@ class JsonParser:
             except (StopIteration, KeyError):
                 continue
 
+        data_blob = Jq.first(post_json, 'data')
+        if isinstance(data_blob, dict) and 'creation_story' in data_blob and 'feedback' in data_blob:
+            return data_blob
 
         raise ParseException('Cannot process post')
 
@@ -468,12 +571,35 @@ class JsonParser:
         with JsonParser.fetch_page(post_path) as html_parser:
             post_json = JsonParser.get_root_node(JsonParser.get_post_json(html_parser))
             likes, cmts, shares = JsonParser.get_interaction_counts(post_json)
-            # noinspection PyTypeChecker
-            post_date = int(Jq.first(post_json['context_layout']['story']['comet_sections']['metadata'], 'creation_time'))
-            post_json = post_json['content']['story']
+            
+            # robust date finding
+            post_date = -1
+            t = Jq.first(post_json, 'creation_time') or Jq.first(post_json, 'created_time')
+            if t:
+                try:
+                    post_date = int(t)
+                except (ValueError, TypeError):
+                    pass
+            if post_date == -1:
+                for bloc in JsonParser.get_json_blocks(html_parser, sort=False):
+                    t = Jq.first(bloc, 'creation_time') or Jq.first(bloc, 'created_time')
+                    if t:
+                        try:
+                            post_date = int(t)
+                            break
+                        except (ValueError, TypeError):
+                            pass
 
-            story = Story(post_json)
-            post_url = story.url
+            story_dict = post_json
+            if 'content' in post_json and isinstance(post_json['content'], dict) and 'story' in post_json['content']:
+                story_dict = post_json['content']['story']
+            elif 'creation_story' in post_json:
+                story_dict = post_json['creation_story']
+                if 'owner' in post_json and ('actors' not in story_dict or not story_dict['actors']):
+                    story_dict['actors'] = [post_json['owner']]
+
+            story = Story(story_dict)
+            post_url = story.url or JsonParser.ensure_full_url(post_path)
             post_content = story.get_text()
             post_group_name = JsonParser.get_group_name(html_parser)
             post_author_name = story.author_name
@@ -588,14 +714,18 @@ class ReelsParser:
 
         raise ParseException('Invalid reels link (vn)')
 
-
     @staticmethod
     def get_content_node(html_parser: BeautifulSoup) -> dict:
         for bloc in JsonParser.get_json_blocks(html_parser):
             if Jq.has(bloc, 'browser_native_sd_url', 'creation_story'):
-                return Jq.first(bloc, 'creation_story')
+                node = Jq.first(bloc, 'creation_story')
+                if node is not None:
+                    return node
+            if Jq.has(bloc, 'short_form_video_context'):
+                node = Jq.first(bloc, 'short_form_video_context')
+                if node is not None:
+                    return node
         raise ParseException('Invalid reels link (cn)')
-
 
     @staticmethod
     def get_reaction_counts(html_parser: BeautifulSoup, is_ig: bool, video_id: str) -> tuple[str, str, str]:
@@ -626,17 +756,36 @@ class ReelsParser:
 
     @staticmethod
     def process_post(post_path: str) -> ParsedPost:
-        with JsonParser.fetch_page(post_path, use_cookies=False) as html_parser:
+        with JsonParser.fetch_page(post_path, use_cookies=True) as html_parser:
             content_node = ReelsParser.get_content_node(html_parser)
 
             video_link = ReelsParser.get_video_link(html_parser)
-            video_id = content_node['id']
-            owner_info = content_node['short_form_video_context']['video_owner']
+            video_id = content_node.get('id') or content_node.get('video', {}).get('id')
+            if not video_id:
+                video_id = Jq.first(content_node, 'id')
+
+            owner_info = content_node.get('short_form_video_context', {}).get('video_owner') or content_node.get('video_owner')
+            if not owner_info:
+                owner_info = Jq.first(content_node, 'video_owner')
+
             is_ig = owner_info['__typename'].startswith('InstagramUser')
             op_name = ('📷 @' if is_ig else '') + owner_info['username' if is_ig else 'name']
-            post_url = content_node['short_form_video_context']['shareable_url']
-            post_date = content_node['creation_time']
-            post_text = '' if content_node['message'] is None else content_node['message']['text']
+            post_url = content_node.get('short_form_video_context', {}).get('shareable_url') or JsonParser.ensure_full_url(post_path)
+
+            post_date = content_node.get('creation_time')
+            if not post_date:
+                for bloc in JsonParser.get_json_blocks(html_parser, sort=False):
+                    post_date = Jq.first(bloc, 'creation_time') or Jq.first(bloc, 'created_time')
+                    if post_date:
+                        try:
+                            post_date = int(post_date)
+                            break
+                        except (ValueError, TypeError):
+                            post_date = None
+            if not post_date:
+                post_date = -1
+
+            post_text = '' if content_node.get('message') is None else content_node['message']['text']
 
             likes, cmts, shares = ReelsParser.get_reaction_counts(html_parser, is_ig, video_id)
 
@@ -659,7 +808,6 @@ class VideoWatchParser:
                 return owner['name']
         raise ParseException('Invalid watch link (opn)')
 
-
     @staticmethod
     def get_content_node(html_parser: BeautifulSoup) -> dict:
         for bloc in JsonParser.get_json_blocks(html_parser):
@@ -680,14 +828,19 @@ class VideoWatchParser:
 
     @staticmethod
     def process_post(post_path: str) -> ParsedPost:
-        with JsonParser.fetch_page(post_path) as html_parser:
+        with JsonParser.fetch_page(post_path, use_cookies=True) as html_parser:
             content_node = VideoWatchParser.get_content_node(html_parser)
 
             video_link = ReelsParser.get_video_link(html_parser)
 
             post_url = JsonParser.ensure_full_url(post_path)
             op_name = VideoWatchParser.get_op_name(html_parser)
-            post_text = content_node['title']['text'] if content_node['title'] else ''
+            post_text = content_node['title']['text'] if (content_node.get('title') and isinstance(content_node['title'], dict) and content_node['title'].get('text')) else ''
+            if not post_text:
+                msg = Jq.first(content_node, 'message')
+                if isinstance(msg, dict):
+                    post_text = msg.get('text', '')
+
             likes = Utils.human_format(content_node['feedback']['reaction_count']['count'])
             shares = 'null'
             cmts = Utils.human_format(content_node['feedback']['total_comment_count'])
@@ -696,15 +849,14 @@ class VideoWatchParser:
             return ParsedPost(op_name, post_text, [], post_url, post_date, likes, cmts, shares, [video_link])
 
 
-def format_error_message_embed(original_url: str, error_code: str = '') -> str:
-    code_suffix = f' [{error_code}]' if error_code else ''
+def format_error_message_embed(original_url: str) -> str:
     return Utils.prettify(f'''<!DOCTYPE html>
 <html lang="">
 <head>
 <meta charset="UTF-8" />
     <meta name="theme-color" content="#2c3048f" />
-    <meta property="og:title" content="Log in or sign up to view{code_suffix}"/>
-    <meta property="og:description" content="See posts, photos and more on Facebook.\nIf viewable in incognito report to git.facebed.com"/>
+    <meta property="og:title" content="Log in or sign up to view"/>
+    <meta property="og:description" content="See posts, photos and more on Facebook."/>
     <meta http-equiv="refresh" content="0;url={quote(original_url)}"/>
 </head>
 </html>''')
@@ -822,13 +974,49 @@ def process_single_photo(post_path: str) -> str:
 
 @app.route('/<path:path>')
 def index(path: str):
+    original_path = path
     if request.query_string:
+        original_path = f"{original_path}?{request.query_string}"
         path += f'?{request.query_string}'
+
+    # /dump diagnostic: strip the suffix, fetch the page, and send raw HTML as an error report
+    if re.match(r'^(.*)/dump/?$', path, re.IGNORECASE):
+        dump_path = re.sub(r'/dump/?$', '', path, flags=re.IGNORECASE)
+        if not dump_path:
+            dump_path = ''
+        try:
+            url = JsonParser.ensure_full_url(dump_path)
+            kw = {'headers': JsonParser.get_headers()}
+            if acc.get_cookies():
+                kw['cookies'] = acc.get_cookies()
+            http_response = requests.get(url, **kw)
+            raw_html = http_response.text
+
+            filename = re.sub(r'[^a-zA-Z0-9]', '_', dump_path)[:80] + '_dump.html'
+            display_path = '/' + dump_path.lstrip('/')
+
+            embed = DiscordEmbed(
+                title="manual dump report",
+                description=f"🔗 [`{display_path}`]({url})\n📋 Manual dump requested by user",
+                color="3498DB"
+            )
+            embed.add_embed_field(name="Attached Payload", value=f"`{filename}`", inline=True)
+            embed.add_embed_field(name="Response Size", value=f"{len(raw_html)} chars", inline=True)
+            Utils.warn(file_content=raw_html.encode('utf-8'), filename=filename, embed=embed)
+
+            logging.info(f'Dump report sent for /{dump_path}')
+        except Exception:
+            logging.error(f'Failed to generate dump for /{dump_path}:\n{traceback.format_exc()}')
+        
+        return process_post(dump_path)
 
     # processing image in comment
     # needs priority because this returns a different link than what the user gave it
     if 'type' in request.query.dict and '3' in request.query.dict['type']:
-        return format_full_post_embed(PhotocomParser.process_post(path))
+        try:
+            return format_full_post_embed(PhotocomParser.process_post(path))
+        except Exception:
+            pass
 
     if not crawleruseragents.is_crawler(request.headers.get('User-Agent', '')):
         response.status = 301
@@ -839,12 +1027,12 @@ def index(path: str):
         if re.match('^(/)?share/v/.*', path):
             path = Utils.resolve_share_link(path)
             if not path:
-                return format_error_message_embed(f'{WWWFB}/{path}', 'C')
+                return format_error_message_embed(f'{WWWFB}/{path}')
 
         if re.match('^(/)?share/([pr]/)?[a-zA-Z0-9-._]*(/)?', path):
             path = Utils.resolve_share_link(path)
             if not path:
-                return format_error_message_embed(f'{WWWFB}/{path}', 'C')
+                return format_error_message_embed(f'{WWWFB}/{path}')
 
         search = re.search(r'/videos/(\d+).*', path)
         if search:
@@ -863,28 +1051,41 @@ def index(path: str):
         if is_facebook_url(path):
             return process_post(path)
         else:
-            return format_error_message_embed('https://git.facebed.com', 'C')
+            return format_error_message_embed('https://git.facebed.com')
 
 
     except NoDataException:
         logging.info(f'No data available for /{path} (login wall / restricted content)')
-        return format_error_message_embed(f'{WWWFB}/{path}', 'C')
+        return format_error_message_embed(f'{WWWFB}/{path}')
     except ParseException as e:
         logging.error(f'Parser bug for /{path}:\n{traceback.format_exc()}')
-        page_url = e.url or f'{WWWFB}/{path}'
-        msg = f'🚨 **ParseException** for `{path}`\n{page_url}\n`{e}`'
+        page_url = e.url or f'{WWWFB}/{original_path}'
+        filename = re.sub(r'[^a-zA-Z0-9]', '_', path)[:80] + '.html' if e.html else None
+        
+        display_path = '/' + original_path.lstrip('/')
+        desc = f"🔗 [`{display_path}`]({page_url})\n🚩 {e}"
+        if filename:
+            desc += " and attached file"
+
+        embed = DiscordEmbed(
+            title="embed failure",
+            description=desc,
+            color="FF0000"
+        )
+        if filename:
+            embed.add_embed_field(name="Attached Payload", value=f"`{filename}`", inline=True)
+
         if e.html:
-            filename = re.sub(r'[^a-zA-Z0-9]', '_', path)[:80] + '.html'
-            Utils.warn(msg, file_content=e.html.encode('utf-8'), filename=filename)
+            Utils.warn(file_content=e.html.encode('utf-8'), filename=filename, embed=embed)
         else:
-            Utils.warn(msg)
-        return format_error_message_embed(f'{WWWFB}/{path}', 'P')
+            Utils.warn(embed=embed)
+        return format_error_message_embed(f'{WWWFB}/{path}')
     except FacebedException:
         logging.warning(f'Unclassified FacebedException for /{path}:\n{traceback.format_exc()}')
-        return format_error_message_embed(f'{WWWFB}/{path}', 'U')
+        return format_error_message_embed(f'{WWWFB}/{path}')
     except Exception:
         logging.error(f'Unexpected error for /{path}:\n{traceback.format_exc()}')
-        return format_error_message_embed(f'{WWWFB}/{path}', 'X')
+        return format_error_message_embed(f'{WWWFB}/{path}')
 
 
 @app.route('/favicon.ico')
@@ -909,7 +1110,16 @@ def log_to_logger(fn):
     @wraps(fn)
     def _log_to_logger(*argsz, **kwargs):
         actual_response = fn(*argsz, **kwargs)
-        logging.info('%s %s %s %s' % (request.remote_addr, request.method, request.url, response.status))
+        title = 'unknown'
+        if isinstance(actual_response, str):
+            error_match = re.search(r'content="Log in or sign up to view \[(.*)\]"', actual_response)
+            if error_match:
+                title = f'Error: {error_match.group(1)}'
+            else:
+                title_match = re.search(r'content="([^"]*)"', actual_response)
+                if title_match:
+                    title = title_match.group(1)
+        logging.info('%s %s %s %s %s' % (request.remote_addr, request.method, request.url, response.status, title))
         return actual_response
 
     return _log_to_logger
@@ -950,7 +1160,7 @@ def main():
         logging.error('python 3.12+ required, see https://docs.python.org/3.12/whatsnew/3.12.html#pep-701-syntactic-formalization-of-f-strings')
         exit(1)
 
-    logging.info(f'listening on {config['host']}:{config['port']}')
+    logging.info(f'listening on {config["host"]}:{config["port"]}')
     app.install(log_to_logger)
     app.run(host=config['host'], port=config['port'], quiet=True)
 

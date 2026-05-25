@@ -171,3 +171,7 @@ test*
 TEST*
 *.md
 *.json
+config.yaml
+*.html
+graph/
+*.txt
