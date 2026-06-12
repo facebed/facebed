@@ -233,30 +233,51 @@ class Story:
     attached_story: Self
 
     def __init__(self, story_json: dict):
+        if 'actors' in story_json or ('node_v2' not in story_json and ('comet_sections' in story_json or 'creation_story' in story_json or 'feedback' in story_json or 'attachments' in story_json)):
+            node_v2 = story_json
+        else:
+            node_v2 = Jq.first(story_json, 'node_v2')
+        if not isinstance(node_v2, dict):
+            node_v2 = {}
+
         self.author_name = ''
         if 'actors' in story_json and story_json['actors'] and isinstance(story_json['actors'], list) and len(story_json['actors']) > 0 and 'name' in story_json['actors'][0]:
             self.author_name = story_json['actors'][0]['name']
+        elif node_v2.get('actors') and isinstance(node_v2['actors'], list) and len(node_v2['actors']) > 0 and 'name' in node_v2['actors'][0]:
+            self.author_name = node_v2['actors'][0]['name']
+        elif node_v2.get('name') and isinstance(node_v2['name'], str) and len(node_v2['name']) > 2:
+            self.author_name = node_v2['name']
+        elif node_v2.get('short_name'):
+            self.author_name = node_v2['short_name']
+        elif story_json.get('name') and isinstance(story_json['name'], str) and len(story_json['name']) > 2:
+            self.author_name = story_json['name']
         else:
-            self.author_name = Jq.first(story_json, 'name')
-            if not self.author_name or not isinstance(self.author_name, str):
-                self.author_name = Jq.first(story_json, 'localized_name') or ''
+            self.author_name = Jq.first(story_json, 'name') or Jq.first(story_json, 'localized_name') or ''
 
         self.text = ''
         if 'message' in story_json and story_json['message'] and 'text' in story_json['message']:
             self.text = story_json['message']['text']
+        elif story_json.get('message') and isinstance(story_json['message'], dict) and story_json['message'].get('text'):
+            self.text = story_json['message']['text']
+        elif story_json.get('text') and isinstance(story_json['text'], str):
+            self.text = story_json['text']
         else:
             self.text = Jq.first(story_json, 'text') or ''
 
         self.image_links = self.get_image_links_post_json(story_json)
         self.video_links = self.get_video_links(story_json)
-        
-        self.url = story_json.get('wwwURL') or Jq.first(story_json, 'url') or ''
+
+        self.url = story_json.get('wwwURL') or node_v2.get('wwwURL') or story_json.get('url') or ''
         if not isinstance(self.url, str):
             self.url = ''
 
         self.author_id = ''
         if 'actors' in story_json and story_json['actors'] and isinstance(story_json['actors'], list) and len(story_json['actors']) > 0 and 'id' in story_json['actors'][0]:
             self.author_id = story_json['actors'][0]['id']
+        elif node_v2.get('actors') and isinstance(node_v2['actors'], list) and len(node_v2['actors']) > 0 and 'id' in node_v2['actors'][0]:
+            self.author_id = node_v2['actors'][0]['id']
+        elif node_v2.get('id'):
+            self.author_id = node_v2['id']
         else:
             self.author_id = Jq.first(story_json, 'id') or ''
 
@@ -453,6 +474,22 @@ class JsonParser:
                 score += 8
             if Jq.has(bloc, 'video_home_www_related_videos_section') or Jq.has(bloc, 'video_home_www_loe_video_permalink_seo_info'):
                 score -= 20
+            node_v2 = Jq.first(bloc, 'node_v2')
+            if isinstance(node_v2, dict):
+                if 'actors' in node_v2 and node_v2['actors']:
+                    score += 30
+                if 'feedback' in node_v2 and isinstance(node_v2['feedback'], dict):
+                    score += 15
+                if 'comet_sections' in node_v2 or 'creation_story' in node_v2:
+                    score += 10
+            data_blob = Jq.first(bloc, 'data')
+            if isinstance(data_blob, dict):
+                if 'actors' in data_blob and data_blob['actors']:
+                    score += 20
+                if 'feedback' in data_blob and isinstance(data_blob['feedback'], dict):
+                    score += 10
+            if 'require' in bloc and not node_v2 and not data_blob:
+                score -= 10
             return score
 
         candidate_blocks.sort(key=score_block, reverse=True)
@@ -470,41 +507,116 @@ class JsonParser:
     @staticmethod
     def get_interaction_counts(post_json: dict) -> tuple[str, str, str]:
         assert post_json
-        
-        post_feedback = Jq.first(post_json, 'comet_ufi_summary_and_actions_renderer')
-        if post_feedback and isinstance(post_feedback, dict) and 'feedback' in post_feedback:
-            fb = post_feedback['feedback']
-            reactions = fb.get('i18n_reaction_count') or Jq.first(fb, 'i18n_reaction_count') or '0'
-            shares = fb.get('i18n_share_count') or Jq.first(fb, 'i18n_share_count') or '0'
-            
-            comments = '0'
-            if 'comment_rendering_instance' in fb and isinstance(fb['comment_rendering_instance'], dict):
-                comments_node = fb['comment_rendering_instance'].get('comments')
-                if comments_node and isinstance(comments_node, dict):
-                    comments = str(comments_node.get('total_count', '0'))
-            if comments == '0':
-                comments = str(fb.get('total_comment_count') or Jq.first(fb, 'total_comment_count') or '0')
-                
-            return str(reactions), str(comments), str(shares)
 
-        fb = Jq.first(post_json, 'feedback')
-        if fb and isinstance(fb, dict):
+        def extract_counts(fb: dict) -> tuple[str, str, str]:
             reactions = fb.get('i18n_reaction_count') or Jq.first(fb, 'i18n_reaction_count') or '0'
             shares = fb.get('i18n_share_count') or fb.get('share_count') or Jq.first(fb, 'i18n_share_count') or Jq.first(fb, 'share_count') or '0'
             comments = fb.get('total_comment_count') or Jq.first(fb, 'total_comment_count')
             if not comments:
-                if 'comment_rendering_instance' in fb and isinstance(fb['comment_rendering_instance'], dict):
-                    comments_node = fb['comment_rendering_instance'].get('comments')
-                    if comments_node and isinstance(comments_node, dict):
-                        comments = comments_node.get('total_count')
+                cri = fb.get('comment_rendering_instance')
+                if isinstance(cri, dict):
+                    cnode = cri.get('comments')
+                    if isinstance(cnode, dict):
+                        comments = cnode.get('total_count')
+                if not comments:
+                    ccsr = fb.get('comments_count_summary_renderer')
+                    if isinstance(ccsr, dict):
+                        fb_inner = ccsr.get('feedback')
+                        if isinstance(fb_inner, dict):
+                            cri2 = fb_inner.get('comment_rendering_instance')
+                            if isinstance(cri2, dict):
+                                cnode2 = cri2.get('comments')
+                                if isinstance(cnode2, dict):
+                                    comments = cnode2.get('total_count')
             if not comments:
                 comments = '0'
             return str(reactions), str(comments), str(shares)
 
+        def best_feedback() -> dict | None:
+            best = None
+            best_reactions = 0
+            for fb in Jq.all(post_json, 'feedback'):
+                if isinstance(fb, dict):
+                    rc = fb.get('i18n_reaction_count')
+                    if rc:
+                        try:
+                            n = int(rc)
+                            if n > best_reactions:
+                                best_reactions = n
+                                best = fb
+                        except (ValueError, TypeError):
+                            pass
+                    elif best is None:
+                        best = fb
+            return best
+
+        post_feedback = Jq.first(post_json, 'comet_ufi_summary_and_actions_renderer')
+        if post_feedback and isinstance(post_feedback, dict) and 'feedback' in post_feedback:
+            return extract_counts(post_feedback['feedback'])
+
+        ufi_in_sections = Jq.first(post_json, 'comet_ufi_summary_and_actions_renderer')
+        if ufi_in_sections:
+            ufi_feedback = ufi_in_sections.get('feedback')
+            if isinstance(ufi_feedback, dict):
+                reactions = ufi_feedback.get('i18n_reaction_count') or Jq.first(ufi_feedback, 'i18n_reaction_count') or '0'
+                shares = ufi_feedback.get('i18n_share_count') or ufi_feedback.get('share_count') or Jq.first(ufi_feedback, 'i18n_share_count') or Jq.first(ufi_feedback, 'share_count') or '0'
+                comments = ufi_feedback.get('total_comment_count') or Jq.first(ufi_feedback, 'total_comment_count')
+                if not comments:
+                    cri = ufi_feedback.get('comment_rendering_instance')
+                    if isinstance(cri, dict):
+                        cnode = cri.get('comments')
+                        if isinstance(cnode, dict):
+                            comments = cnode.get('total_count')
+                    if not comments:
+                        ccsr = ufi_feedback.get('comments_count_summary_renderer')
+                        if isinstance(ccsr, dict):
+                            fb_inner = ccsr.get('feedback')
+                            if isinstance(fb_inner, dict):
+                                cri2 = fb_inner.get('comment_rendering_instance')
+                                if isinstance(cri2, dict):
+                                    cnode2 = cri2.get('comments')
+                                    if isinstance(cnode2, dict):
+                                        comments = cnode2.get('total_count')
+                if not comments:
+                    comments = '0'
+                if reactions != '0' or shares != '0' or comments != '0':
+                    return str(reactions), str(comments), str(shares)
+
+        fb = Jq.first(post_json, 'feedback')
+        if fb and isinstance(fb, dict):
+            rc = fb.get('i18n_reaction_count')
+            if rc:
+                return extract_counts(fb)
+            best = best_feedback()
+            if best:
+                return extract_counts(best)
+
+        best = best_feedback()
+        if best:
+            return extract_counts(best)
+
         reactions = Jq.first(post_json, 'i18n_reaction_count') or '0'
         shares = Jq.first(post_json, 'i18n_share_count') or Jq.first(post_json, 'share_count') or '0'
-        comments = Jq.first(post_json, 'total_comment_count') or '0'
-        
+        comments = Jq.first(post_json, 'total_comment_count')
+        if not comments:
+            cri = Jq.first(post_json, 'comment_rendering_instance')
+            if isinstance(cri, dict):
+                cnode = cri.get('comments')
+                if isinstance(cnode, dict):
+                    comments = cnode.get('total_count')
+            if not comments:
+                ccsr = Jq.first(post_json, 'comments_count_summary_renderer')
+                if isinstance(ccsr, dict):
+                    fb_inner = ccsr.get('feedback')
+                    if isinstance(fb_inner, dict):
+                        cri2 = fb_inner.get('comment_rendering_instance')
+                        if isinstance(cri2, dict):
+                            cnode2 = cri2.get('comments')
+                            if isinstance(cnode2, dict):
+                                comments = cnode2.get('total_count')
+        if not comments:
+            comments = '0'
+
         return str(reactions), str(comments), str(shares)
 
     @staticmethod
@@ -516,12 +628,16 @@ class JsonParser:
                 if short_form:
                     return {'creation_story': short_form}
                 return {}
-            if 'comet_ufi_summary_and_actions_renderer' in data_blob:   # single photo
+            if 'comet_ufi_summary_and_actions_renderer' in data_blob:
                 return data_blob
-            elif 'node_v2' in data_blob and isinstance(data_blob['node_v2'], dict) and 'comet_sections' in data_blob['node_v2']:
-                return data_blob['node_v2']['comet_sections']
-            elif 'node' in data_blob and isinstance(data_blob['node'], dict) and 'comet_sections' in data_blob['node']:
-                return data_blob['node']['comet_sections']
+            elif 'node_v2' in data_blob and isinstance(data_blob['node_v2'], dict):
+                node_v2 = data_blob['node_v2']
+                if 'comet_sections' in node_v2 or 'creation_story' in node_v2:
+                    return node_v2
+            elif 'node' in data_blob and isinstance(data_blob['node'], dict):
+                node = data_blob['node']
+                if 'comet_sections' in node or 'creation_story' in node:
+                    return node
             short_form = Jq.first(data_blob, 'short_form_video_context')
             if short_form:
                 return {'creation_story': short_form}
@@ -529,16 +645,22 @@ class JsonParser:
 
         def work_group_post() -> dict:
             hoisted_feed = Jq.first(post_json, 'group_hoisted_feed')
-            if isinstance(hoisted_feed, dict) and 'comet_sections' in hoisted_feed:
-                return hoisted_feed['comet_sections']
-            
+            if isinstance(hoisted_feed, dict):
+                if 'comet_sections' in hoisted_feed or 'creation_story' in hoisted_feed:
+                    return hoisted_feed
+                node_v2 = Jq.first(hoisted_feed, 'node_v2')
+                if isinstance(node_v2, dict):
+                    return node_v2
+
             data_blob = Jq.first(post_json, 'data')
             if isinstance(data_blob, dict):
                 group = data_blob.get('group')
                 if isinstance(group, dict):
-                    comet_sections = Jq.first(group, 'comet_sections')
-                    if comet_sections:
-                        return comet_sections
+                    if 'comet_sections' in group or 'creation_story' in group:
+                        return group
+                    node_v2 = Jq.first(group, 'node_v2')
+                    if isinstance(node_v2, dict):
+                        return node_v2
             return {}
 
         methods: list[Callable[[], dict]] = [work_normal_post, work_group_post]
@@ -548,14 +670,15 @@ class JsonParser:
                 ret = method()
                 if ret:
                     return ret
-                else:
-                    continue
             except (StopIteration, KeyError):
                 continue
 
         data_blob = Jq.first(post_json, 'data')
-        if isinstance(data_blob, dict) and 'creation_story' in data_blob and 'feedback' in data_blob:
-            return data_blob
+        if isinstance(data_blob, dict):
+            if 'creation_story' in data_blob and 'feedback' in data_blob:
+                return data_blob
+            if 'node_v2' in data_blob and isinstance(data_blob['node_v2'], dict):
+                return data_blob['node_v2']
 
         raise ParseException('Cannot process post')
 
@@ -597,6 +720,12 @@ class JsonParser:
                 story_dict = post_json['creation_story']
                 if 'owner' in post_json and ('actors' not in story_dict or not story_dict['actors']):
                     story_dict['actors'] = [post_json['owner']]
+            elif 'comet_sections' in post_json:
+                sections = post_json['comet_sections']
+                if isinstance(sections, dict) and 'content' in sections and isinstance(sections['content'], dict) and 'story' in sections['content']:
+                    story_dict = sections['content']['story']
+                elif 'feedback' in post_json:
+                    pass
 
             story = Story(story_dict)
             post_url = story.url or JsonParser.ensure_full_url(post_path)
