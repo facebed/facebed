@@ -26,11 +26,6 @@ system installation (not recommended)
 4. Copy `user_config.example.py` to `user_config.py` and edit the self-explanatory options
 5. Start the `start.py` script
 
-## Remote updating
-This feature allows remote update triggers (git pull-ing and running a restart command)
-for instance maintainers. The `/update` endpoint is protected with HTTP username and password,
-which are set in the file `user_config.py`.
-
 ## Cookies (DO NOT USE)
 Use the cookies exported using the extension Cookie Editor with the json format. Will warn 
 maintainers if any cookies expired.
