@@ -1,5 +1,7 @@
 import argparse
 import base64
+import gzip
+import hashlib
 import io
 import json
 import logging
@@ -271,16 +273,17 @@ class CFFI:
                     final_url = str(upstream_response.url)
                     status_code = int(upstream_response.status_code)
                     location = upstream_response.headers.get('Location')
-                    logging.info(
-                        'upstream %s %s -> %s status=%s redirect_hop=%s bytes=%s attempt=%s',
-                        current_method,
-                        current_url,
-                        final_url,
-                        status_code,
-                        len(history),
-                        content_bytes,
-                        attempt,
-                    )
+                    if current_method != 'GET' or current_url != final_url:
+                        logging.info(
+                            'upstream %s %s -> %s status=%s redirect_hop=%s bytes=%s attempt=%s',
+                            current_method,
+                            current_url,
+                            final_url,
+                            status_code,
+                            len(history),
+                            content_bytes,
+                            attempt,
+                        )
                     self._local.responses.append({
                         'method': current_method,
                         'requested_url': current_url,
@@ -425,7 +428,7 @@ FACEBOOK_REACTION_NAME_IDS = {
 class ConsoleFormatter(logging.Formatter):
     def format(self, record):
         return re.sub(
-            r'https://(?:www\.)?facebook\.com(?![\w.@:-])/*',
+            r'https://(?:www\.)?(?:facebook|facebed)\.com(?![\w.@:-])/*',
             '/', super().format(record), flags=re.IGNORECASE,
         )
 
@@ -728,6 +731,11 @@ class Utils:
                     )
                 return direct_path, None
             raise NoDataException('Facebook redirected share link outside Facebook')
+        if page_type in {
+            JsonParser.PROBE_LOGIN_WALL,
+            JsonParser.PROBE_PRIVATE_GROUP,
+        }:
+            JsonParser.raise_for_probe_result(page_type, direct_path)
         if direct_response.status_code >= 400 and page_type != 'has_data':
             raise UpstreamException(
                 f'Facebook returned HTTP {direct_response.status_code} for {url}', direct_response
@@ -776,10 +784,15 @@ class Utils:
             if not wh or not wh.startswith('https://discord.com/api/webhooks/'):
                 return
             try:
-                webhook = DiscordWebhook(url=wh, content=msg)
+                webhook = DiscordWebhook(
+                    url=wh,
+                    content=msg,
+                    rate_limit_retry=True,
+                    timeout=30,
+                )
                 if embed:
                     webhook.add_embed(embed)
-                if file_content and filename:
+                if file_content is not None and filename:
                     webhook.add_file(file=file_content, filename=filename)
                 webhook.execute()
             except Exception:
@@ -1986,6 +1999,11 @@ class JsonParser:
                 _bypass_cache=True,
             )
             raw_html, html_parser, page_type = prepare_page(http_response)
+        if page_type in {
+            JsonParser.PROBE_LOGIN_WALL,
+            JsonParser.PROBE_PRIVATE_GROUP,
+        }:
+            JsonParser.raise_for_probe_result(page_type, post_path)
         if (
             http_response.status_code >= 400
             and page_type != JsonParser.PROBE_HAS_DATA
@@ -3513,6 +3531,147 @@ def _send_dump_report(
         logging.error("couldn't dump /%s\n%s", path, traceback.format_exc())
 
 
+def _discord_text(value: object, limit: int = 1024) -> str:
+    text = str(value).replace('\x00', '')
+    if len(text) <= limit:
+        return text
+    return text[:max(0, limit - 1)] + '…'
+
+
+def _human_bytes(size: int) -> str:
+    amount = float(size)
+    for unit in ('B', 'KiB', 'MiB', 'GiB'):
+        if amount < 1024 or unit == 'GiB':
+            precision = 0 if unit == 'B' else 1
+            return f'{amount:.{precision}f} {unit}'
+        amount /= 1024
+    return f'{size} B'
+
+
+def _restricted_page_attachment(
+    origin_url: str,
+    reason: str,
+    raw_bytes: bytes,
+) -> tuple[bytes, str]:
+    digest = hashlib.sha256(raw_bytes).hexdigest()
+    origin_name = urlparse(origin_url).path.strip('/') or 'facebook'
+    stem = re.sub(r'[^a-zA-Z0-9._-]', '_', origin_name)[:52].strip('._-')
+    reason_name = re.sub(r'[^a-zA-Z0-9._-]', '_', reason)[:24].strip('._-')
+    filename = '_'.join(filter(None, (stem, reason_name, digest[:12])))
+    file_content = raw_bytes
+    suffix = '.html'
+    if len(raw_bytes) > 7 * 1024 * 1024:
+        file_content = gzip.compress(raw_bytes, compresslevel=6, mtime=0)
+        suffix += '.gz'
+    return file_content, (filename or f'facebook_{digest[:12]}') + suffix
+
+
+def _upstream_redirect_chain(http_response: CffiResponse) -> str:
+    chain = [*(getattr(http_response, 'history', None) or []), http_response]
+    return '\n'.join(
+        f'`{getattr(item, "status_code", "?")}` {_discord_text(getattr(item, "url", "?"), 850)}'
+        for item in chain
+    )
+
+
+def _send_restricted_page_report(
+    origin_path: str,
+    error: NoDataException,
+    http_response: CffiResponse | None = None,
+) -> None:
+    wh = config.get('notifier_webhook', '')
+    if not wh or not wh.startswith('https://discord.com/api/webhooks/'):
+        return
+
+    try:
+        origin_url = JsonParser.ensure_full_url(origin_path)
+        reason = str(getattr(error, 'reason_code', 'no_data'))
+        title = {
+            'login_wall': 'Facebook login wall detected',
+            'private_group_post_unavailable': 'Restricted Facebook page detected',
+        }.get(reason, 'Facebook content unavailable or restricted')
+        embed = DiscordEmbed(
+            title=title,
+            description=_discord_text(' '.join(str(error).split()), 1500),
+            color='ED4245',
+        )
+        if len(origin_url) <= 2048:
+            embed.set_url(origin_url)
+        embed.set_timestamp()
+        embed.set_footer(text='facebed notifier • exact upstream response attached')
+        embed.add_embed_field(
+            name='Detection', value=f'`{_discord_text(reason, 120)}`', inline=True
+        )
+        embed.add_embed_field(
+            name='Page type',
+            value=f'`{failed_post_type(origin_path, http_response, reason)}`',
+            inline=True,
+        )
+        embed.add_embed_field(
+            name='Origin URL', value=_discord_text(origin_url, 900), inline=False
+        )
+
+        file_content = None
+        filename = None
+        if http_response is None:
+            embed.add_embed_field(
+                name='Upstream response',
+                value='No body-bearing upstream response was captured.',
+                inline=False,
+            )
+        else:
+            final_url = str(getattr(http_response, 'url', '') or origin_url)
+            status = getattr(http_response, 'status_code', 'unknown')
+            headers = getattr(http_response, 'headers', {}) or {}
+            content_type = (
+                headers.get('Content-Type')
+                or headers.get('content-type')
+                or 'unknown'
+            )
+            raw_bytes = bytes(getattr(http_response, 'content', b'') or b'')
+            file_content, filename = _restricted_page_attachment(
+                origin_url, reason, raw_bytes
+            )
+            embed.add_embed_field(
+                name='Upstream response',
+                value=(
+                    f'HTTP `{status}` • `{_discord_text(content_type, 250)}` • '
+                    f'`{_human_bytes(len(raw_bytes))}`'
+                ),
+                inline=False,
+            )
+            embed.add_embed_field(
+                name='Final upstream URL',
+                value=_discord_text(final_url, 900),
+                inline=False,
+            )
+            history = getattr(http_response, 'history', None) or []
+            if history:
+                embed.add_embed_field(
+                    name=f'Redirect chain ({len(history)} hop(s))',
+                    value=_discord_text(_upstream_redirect_chain(http_response), 900),
+                    inline=False,
+                )
+
+        Utils.warn(
+            file_content=file_content,
+            filename=filename,
+            embed=embed,
+        )
+        logging.info(
+            'restricted page report queued reason=%s url=%s bytes=%s',
+            reason,
+            origin_url,
+            len(file_content) if file_content is not None else 0,
+        )
+    except Exception:
+        logging.error(
+            "couldn't report restricted page /%s\n%s",
+            origin_path,
+            traceback.format_exc(),
+        )
+
+
 def _authentication_wall_reason(
     final_url: str,
     html_parser: BeautifulSoup,
@@ -3724,6 +3883,8 @@ def index(path: str):
             f'{WWWFB}/{original_path}',
             ' '.join(str(exc).split()),
         )
+        if isinstance(exc, NoDataException):
+            _send_restricted_page_report(original_path, exc, selected_response)
         result = format_error_message_embed(f'{WWWFB}/{original_path}')
 
     if dump_requested:
