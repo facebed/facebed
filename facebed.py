@@ -273,7 +273,7 @@ class CFFI:
                     final_url = str(upstream_response.url)
                     status_code = int(upstream_response.status_code)
                     location = upstream_response.headers.get('Location')
-                    if current_method != 'GET' or current_url != final_url:
+                    if current_url != final_url:
                         logging.info(
                             'upstream %s %s -> %s status=%s redirect_hop=%s bytes=%s attempt=%s',
                             current_method,
@@ -763,6 +763,14 @@ class Utils:
                 'Facebook resolved share link to a group landing page',
                 reason_code='private_group_post_unavailable',
             )
+        if (
+            page_type == JsonParser.PROBE_UNKNOWN
+            and declared_target
+            and direct_path != Utils.normalize_facebook_path(str(direct_response.url))
+        ):
+            # Metadata can identify a post without containing its payload.
+            # Let the parser fetch that target instead of reusing the share page.
+            return direct_path, None
         return (
             direct_path,
             direct_response
