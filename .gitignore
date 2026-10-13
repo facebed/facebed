@@ -177,3 +177,6 @@ config.yaml
 *.html
 graph/
 *.txt
+fulltest/
+TOBEFIXED/
+.discord-secret

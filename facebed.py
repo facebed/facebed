@@ -39,15 +39,26 @@ SHARE_BODY_USER_AGENT = 'Mozilla/5.0 (compatible; Discordbot/2.0; +https://disco
 
 
 class FacebedException(Exception):
-    pass
+    reason_code = 'facebed_error'
 
 
 class NoDataException(FacebedException):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_code: str = 'no_data',
+        terminal: bool = False,
+    ):
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.terminal = terminal
 
 
-class UnsupportedRouteException(NoDataException):
-    pass
+class UnsupportedRouteException(FacebedException):
+    def __init__(self, message: str, *, reason_code: str = 'unsupported_route'):
+        super().__init__(message)
+        self.reason_code = reason_code
 
 
 class ShareResolutionException(NoDataException):
@@ -56,14 +67,23 @@ class ShareResolutionException(NoDataException):
         message: str,
         response: CffiResponse | None = None,
         count_as_error: bool = False,
+        *,
+        reason_code: str = 'share_resolution_failed',
+        terminal: bool = False,
     ):
-        super().__init__(message)
+        super().__init__(
+            message,
+            reason_code=reason_code,
+            terminal=terminal,
+        )
         self.upstream_response = response
         self.count_as_error = count_as_error
         self.account_backed = False
 
 
 class ParseException(FacebedException):
+    reason_code = 'parser_error'
+
     def __init__(self, message: str, html: str = '', url: str = ''):
         super().__init__(message)
         self.html = html
@@ -71,6 +91,8 @@ class ParseException(FacebedException):
 
 
 class UpstreamException(FacebedException):
+    reason_code = 'upstream_error'
+
     def __init__(
         self,
         message: str,
@@ -83,6 +105,14 @@ class UpstreamException(FacebedException):
             response is None if transport_error is None else transport_error
         )
         self.status_code = getattr(response, 'status_code', None)
+        self.reason_code = (
+            'upstream_transport_error'
+            if self.transport_error
+            else (
+                f'upstream_http_{self.status_code}'
+                if self.status_code is not None else 'upstream_error'
+            )
+        )
         self.retry_after = None
         if response is not None:
             self.retry_after = response.headers.get('Retry-After')
@@ -361,7 +391,19 @@ FACEBOOK_REACTION_NAME_IDS = {
     'sad': '908563459236466',
     'angry': '444813342392137',
 }
-logging.basicConfig(format='[%(levelname)s] [%(asctime)s] %(message)s', level=logging.INFO)
+class ConsoleFormatter(logging.Formatter):
+    def format(self, record):
+        return re.sub(
+            r'https://(?:www\.)?facebook\.com(?![\w.@:-])/*',
+            '/', super().format(record), flags=re.IGNORECASE,
+        )
+
+
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(ConsoleFormatter(
+    '[%(levelname)s] [%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S',
+))
+logging.basicConfig(level=logging.INFO, handlers=[_console_handler])
 
 
 def quote(s: str) -> str:
@@ -395,6 +437,62 @@ class Utils:
         return value
 
     @staticmethod
+    def facebook_path_segments(url_or_path: str) -> tuple[str, ...]:
+        value = str(url_or_path)
+        parsed = urlparse(value)
+        if parsed.netloc:
+            hostname = (parsed.hostname or '').lower()
+            if hostname != 'facebook.com' and not hostname.endswith('.facebook.com'):
+                return ()
+            path = parsed.path
+        else:
+            normalized = Utils.normalize_facebook_path(value)
+            parsed_normalized = urlparse('/' + normalized.lstrip('/'))
+            path = parsed_normalized.path
+        return tuple(part for part in path.split('/') if part)
+
+    @staticmethod
+    def is_facebook_url(url: str, *, require_https: bool = False) -> bool:
+        parsed = urlparse(str(url))
+        hostname = (parsed.hostname or '').lower()
+        if hostname != 'facebook.com' and not hostname.endswith('.facebook.com'):
+            return False
+        if require_https and parsed.scheme.lower() != 'https':
+            return False
+        return parsed.scheme.lower() in {'http', 'https'}
+
+    @staticmethod
+    def is_safe_media_url(url: str) -> bool:
+        parsed = urlparse(str(url))
+        return bool(
+            parsed.scheme.lower() == 'https'
+            and parsed.hostname
+            and parsed.username is None
+            and parsed.password is None
+        )
+
+    @staticmethod
+    def is_control_path(url_or_path: str, *names: str) -> bool:
+        parts = Utils.facebook_path_segments(url_or_path)
+        if not parts:
+            return False
+        first = parts[0].casefold().removesuffix('.php')
+        return first in {str(name).casefold().removesuffix('.php') for name in names}
+
+    @staticmethod
+    def is_post_like_path(url_or_path: str) -> bool:
+        value = Utils.normalize_facebook_path(url_or_path)
+        path = urlparse('/' + value.lstrip('/')).path
+        return bool(
+            re.search(
+                r'/(?:posts|permalink|reel|watch|videos|v|photos)(?:/|$)',
+                '/' + path.lstrip('/'),
+                re.IGNORECASE,
+            )
+            or re.match(r'^/?(?:story|permalink|photo)\.php/?$', path, re.IGNORECASE)
+        )
+
+    @staticmethod
     def is_share_path(path: str) -> bool:
         return bool(re.match(r'^/?share(?:/|$)', urlparse(path).path, re.IGNORECASE))
 
@@ -419,21 +517,27 @@ class Utils:
                 return resolved_path, prefetched_response
             except ShareResolutionException:
                 raise
-            except (NoDataException, UpstreamException) as exc:
+            except UnsupportedRouteException:
+                raise
+            except NoDataException as exc:
                 raise ShareResolutionException(
                     str(exc),
                     getattr(exc, 'upstream_response', None),
-                    count_as_error=(
-                        isinstance(exc, UpstreamException)
-                        and exc.transport_error
-                    ),
+                    count_as_error=False,
+                    reason_code=getattr(exc, 'reason_code', 'share_resolution_failed'),
+                    terminal=getattr(exc, 'terminal', False),
                 ) from exc
 
     @staticmethod
     def _resolve_share_link(path: str) -> tuple[str, CffiResponse | None]:
         source_path = Utils.normalize_facebook_path(path)
         url = JsonParser.ensure_full_url(source_path)
-        is_share_v = urlparse(source_path).path.strip('/').startswith('share/v/')
+        source_parts = Utils.facebook_path_segments(source_path)
+        is_share_v = (
+            len(source_parts) >= 2
+            and source_parts[0].casefold() == 'share'
+            and source_parts[1].casefold() == 'v'
+        )
         logging.info(f'resolving share link {url}')
         head_response = None
         try:
@@ -450,35 +554,38 @@ class Utils:
             head_url = str(head_response.url)
             head_path = Utils.normalize_facebook_path(head_url)
             parsed_head_url = urlparse(head_url)
-            head_url_path = parsed_head_url.path.lower()
             head_hostname = (parsed_head_url.hostname or '').lower()
             head_is_facebook = (
                 head_hostname == 'facebook.com'
                 or head_hostname.endswith('.facebook.com')
             )
-            normalized_head_path = head_url_path.strip('/')
             head_is_group_landing = Utils.is_group_landing_target(head_path)
-            head_is_post_like = (
-                normalized_head_path.startswith('watch')
-                or normalized_head_path.startswith('reel/')
-                or '/videos/' in normalized_head_path
-                or (
-                    normalized_head_path.startswith('groups/')
-                    and (
-                        '/permalink/' in normalized_head_path
-                        or '/posts/' in normalized_head_path
+            head_is_post_like = Utils.is_post_like_path(head_path)
+            head_parts = Utils.facebook_path_segments(head_path)
+            head_is_video_like = bool(
+                head_parts
+                and (
+                    head_parts[0].casefold() in {'watch', 'reel'}
+                    or any(part.casefold() == 'videos' for part in head_parts)
+                    or (
+                        head_parts[0].casefold() == 'groups'
+                        and any(
+                            part.casefold() in {'posts', 'permalink'}
+                            for part in head_parts
+                        )
                     )
                 )
             )
             head_usable = (
                 head_is_facebook
                 and not head_is_group_landing
-                and (not is_share_v or head_is_post_like)
+                and head_is_post_like
+                and (not is_share_v or head_is_video_like)
             )
             needs_get = (
                 head_response.status_code >= 400
                 or Utils.is_share_path(head_path)
-                or head_url_path.startswith('/login')
+                or Utils.is_control_path(head_url, 'login', 'checkpoint', 'recover')
                 or not head_usable
             )
             if not needs_get:
@@ -528,9 +635,20 @@ class Utils:
             direct_path = Utils.normalize_facebook_path(direct_url)
             page_type = 'unknown'
             if response_is_facebook:
-                page_type = JsonParser.probe_page_type(html_parser, direct_path)
-                if page_type != 'has_data' and source_path != direct_path:
-                    page_type = JsonParser.probe_page_type(html_parser, source_path)
+                page_type = JsonParser.probe_page_type(
+                    html_parser,
+                    direct_path,
+                    response_url=response_url,
+                )
+                if (
+                    page_type == JsonParser.PROBE_UNKNOWN
+                    and source_path != direct_path
+                ):
+                    page_type = JsonParser.probe_page_type(
+                        html_parser,
+                        source_path,
+                        response_url=response_url,
+                    )
             return (
                 direct_url,
                 direct_path,
@@ -570,7 +688,6 @@ class Utils:
                 declared_target,
                 response_is_facebook,
             ) = inspect_direct(direct_response)
-        response_url_path = urlparse(str(direct_response.url)).path
         logging.info(f'resolved to {direct_url}')
         if not response_is_facebook:
             if declared_target:
@@ -584,18 +701,38 @@ class Utils:
             raise UpstreamException(
                 f'Facebook returned HTTP {direct_response.status_code} for {url}', direct_response
             )
+        JsonParser.raise_for_probe_result(page_type, direct_path)
         if Utils.is_share_path(direct_path):
             if page_type == 'has_data':
                 return source_path, direct_response
-            raise NoDataException('Facebook left the share URL unresolved without post data')
-        if response_url_path.lower().startswith('/login'):
+            raise NoDataException(
+                'Facebook left the share URL unresolved without post data',
+                reason_code='share_target_unresolved',
+            )
+        if Utils.is_control_path(
+            str(direct_response.url), 'login', 'checkpoint', 'recover'
+        ):
             if page_type == 'has_data':
                 return source_path, direct_response
-            raise NoDataException('Facebook redirected share link to login')
+            raise NoDataException(
+                'Facebook redirected share link to authentication',
+                reason_code='login_wall',
+            )
 
         if Utils.is_group_landing_target(direct_path):
-            raise NoDataException('Facebook resolved share link to a group landing page')
-        return direct_path, direct_response if page_type == 'has_data' else None
+            raise NoDataException(
+                'Facebook resolved share link to a group landing page',
+                reason_code='private_group_post_unavailable',
+            )
+        return (
+            direct_path,
+            direct_response
+            if page_type in {
+                JsonParser.PROBE_HAS_DATA,
+                JsonParser.PROBE_UNKNOWN,
+            }
+            else None,
+        )
 
     @staticmethod
     def prettify(txt: str) -> str:
@@ -1301,6 +1438,12 @@ class Story:
 
     @staticmethod
     def get_image_links_post_json(post_json: dict) -> list[str]:
+        def is_sticker(value: dict) -> bool:
+            return any(
+                isinstance(node, dict) and node.get('__typename') == 'Sticker'
+                for node in [value, *Jq.enumerate(value)]
+            )
+
         all_attachments = Jq.all(post_json, 'attachment')
         for attachment_set in all_attachments:
             if any([k.endswith('subattachments') for k in attachment_set]):
@@ -1313,7 +1456,7 @@ class Story:
                         images = [x['uri'] for x in Jq.all(subsets[0], 'viewer_image')]
                         if images:
                             return images
-            elif 'media' in attachment_set and "'__typename': 'Sticker'" not in str(attachment_set):
+            elif 'media' in attachment_set and not is_sticker(attachment_set):
                 simplet_set = [x['uri'] for x in Jq.all(attachment_set, 'photo_image')]
                 if simplet_set:
                     return simplet_set
@@ -1352,6 +1495,34 @@ def banned(url: str) -> ParsedPost:
 
 
 class JsonParser:
+    IDENTITY_FIELDS = frozenset({
+        'id', 'video_id', 'videoid', 'post_id', 'postid', 'story_fbid',
+        'storyfbid', 'story_id', 'storyid', 'fbid', 'legacy_fbid',
+        'top_level_post_id', 'mf_story_key', 'feedback_id',
+    })
+    IDENTITY_URL_FIELDS = frozenset({
+        'url', 'wwwurl', 'permalink', 'permalink_url', 'shareable_url',
+        'canonical_url',
+    })
+    CONTENT_ROUTE_NAMES = frozenset({
+        'comet.fbweb.CometSinglePostDialogRoute',
+        'comet.fbweb.CometGroupLoggedOutPermalinkRoute',
+        'comet.fbweb.CometFBReelsRoute',
+        'comet.fbweb.CometVideoHomeLOEVideoPermalinkRoute',
+        'comet.fbweb.CometPhotoRoute',
+    })
+    PROBE_HAS_DATA = 'has_data'
+    PROBE_UNKNOWN = 'unknown'
+    PROBE_NO_DATA = 'no_data'
+    PROBE_LOGIN_WALL = 'login_wall'
+    PROBE_TARGET_NOT_FOUND = 'target_not_found'
+    PROBE_TARGET_IDENTITY_MISMATCH = 'target_identity_mismatch'
+    PROBE_PRIVATE_GROUP = 'private_group_post_unavailable'
+    PROBE_TARGET_VIDEO_MISSING = 'target_video_payload_missing'
+    PROBE_UNSUPPORTED_PROFILE = 'unsupported_profile_target'
+    PROBE_UNSUPPORTED_MARKETPLACE = 'unsupported_marketplace_target'
+    PROBE_UNSUPPORTED_MEDIA_SET = 'unsupported_media_set_target'
+
     @staticmethod
     def get_headers() -> dict:
         headers = {
@@ -1393,6 +1564,169 @@ class JsonParser:
         return data_blocks
 
     @staticmethod
+    def get_initial_routes(blocks: list[dict]) -> list[dict]:
+        routes = []
+        for block in blocks:
+            route_info = Jq.first(block, 'initialRouteInfo')
+            route = route_info.get('route') if isinstance(route_info, dict) else None
+            if isinstance(route, dict) and route not in routes:
+                routes.append(route)
+        return routes
+
+    @staticmethod
+    def get_declared_urls(
+        html_parser: BeautifulSoup,
+        *,
+        property_name: str | None = None,
+    ) -> list[str]:
+        urls: list[str] = []
+        if property_name in (None, 'canonical'):
+            for link in html_parser.find_all('link'):
+                rel = link.get('rel') or []
+                if 'canonical' in rel and link.get('href'):
+                    urls.append(str(link['href']))
+        if property_name in (None, 'og:url'):
+            for meta in html_parser.find_all('meta', attrs={'property': 'og:url'}):
+                if meta.get('content'):
+                    urls.append(str(meta['content']))
+        return list(dict.fromkeys(urls))
+
+    @staticmethod
+    def direct_identity_ids(node: dict) -> set[str]:
+        identities: set[str] = set()
+        if not isinstance(node, dict):
+            return identities
+        for key, item in node.items():
+            key_name = str(key).lower()
+            if key_name in JsonParser.IDENTITY_FIELDS:
+                if isinstance(item, (str, int)) and str(item):
+                    identities.add(str(item))
+                elif isinstance(item, list):
+                    identities.update(
+                        str(part) for part in item
+                        if isinstance(part, (str, int)) and str(part)
+                    )
+            elif key_name in JsonParser.IDENTITY_URL_FIELDS and isinstance(item, str):
+                parsed_item = urlparse(item)
+                if (
+                    not parsed_item.netloc
+                    or Utils.is_facebook_url(item, require_https=True)
+                ):
+                    identities.update(JsonParser.get_requested_ids(item))
+        return identities
+
+    @staticmethod
+    def directly_contains_exact_id(node: dict, requested_ids: list[str]) -> bool:
+        return bool(set(map(str, requested_ids)).intersection(
+            JsonParser.direct_identity_ids(node)
+        ))
+
+    @staticmethod
+    def direct_video_identity_ids(node: dict) -> set[str]:
+        if not isinstance(node, dict):
+            return set()
+        identities = {
+            str(node[key])
+            for key in ('id', 'video_id', 'videoid')
+            if isinstance(node.get(key), (str, int)) and str(node[key])
+        }
+        legacy = node.get('videoDeliveryLegacyFields')
+        if isinstance(legacy, dict):
+            identities.update(
+                str(legacy[key])
+                for key in ('id', 'video_id', 'videoid')
+                if isinstance(legacy.get(key), (str, int)) and str(legacy[key])
+            )
+        return identities
+
+    @staticmethod
+    def direct_video_url(node: dict) -> str | None:
+        if not isinstance(node, dict):
+            return None
+        for key in ('browser_native_hd_url', 'browser_native_sd_url'):
+            value = node.get(key)
+            if isinstance(value, str) and Utils.is_safe_media_url(value):
+                return value
+        legacy = node.get('videoDeliveryLegacyFields')
+        if isinstance(legacy, dict):
+            for key in ('browser_native_hd_url', 'browser_native_sd_url'):
+                value = legacy.get(key)
+                if isinstance(value, str) and Utils.is_safe_media_url(value):
+                    return value
+        return None
+
+    @staticmethod
+    def get_video_delivery_nodes(blocks: list[dict]) -> list[dict]:
+        nodes: list[dict] = []
+        seen: set[int] = set()
+        for block in blocks:
+            for node in [block, *Jq.enumerate(block)]:
+                if not isinstance(node, dict) or not JsonParser.direct_video_url(node):
+                    continue
+                marker = id(node)
+                if marker not in seen:
+                    seen.add(marker)
+                    nodes.append(node)
+        return nodes
+
+    @staticmethod
+    def has_target_video_delivery(blocks: list[dict], target_ids: list[str]) -> bool:
+        target_id_set = set(map(str, target_ids))
+        return any(
+            target_id_set.intersection(
+                JsonParser.direct_video_identity_ids(node)
+            )
+            for node in JsonParser.get_video_delivery_nodes(blocks)
+        )
+
+    @staticmethod
+    def has_bounded_target_payload(
+        blocks: list[dict], target_ids: list[str]
+    ) -> bool:
+        if not target_ids:
+            return False
+        for block in blocks:
+            for node in [block, *Jq.enumerate(block)]:
+                if not isinstance(node, dict):
+                    continue
+                if not JsonParser.directly_contains_exact_id(node, target_ids):
+                    continue
+                if JsonParser.direct_video_url(node):
+                    return True
+                if isinstance(node.get('creation_story'), dict):
+                    return True
+                for key in (
+                    'actors', 'attachments', 'comet_sections', 'content',
+                    'message', 'owner', 'title', 'image', 'photo_image',
+                    'container_story', 'attached_comment',
+                ):
+                    value = node.get(key)
+                    if value not in (None, '', [], {}):
+                        return True
+        return False
+
+    @staticmethod
+    def get_terminal_video_id(post_path: str) -> str | None:
+        parsed = urlparse(JsonParser.ensure_full_url(post_path))
+        parts = [part for part in parsed.path.split('/') if part]
+        videos_index = next(
+            (
+                index for index, part in enumerate(parts)
+                if part.casefold() == 'videos'
+            ),
+            None,
+        )
+        if videos_index is None:
+            return None
+        video_parts = parts[videos_index + 1:]
+        if (
+            len(video_parts) not in {1, 2}
+            or not video_parts[-1].isdigit()
+        ):
+            return None
+        return video_parts[-1]
+
+    @staticmethod
     def get_requested_ids(post_path: str) -> list[str]:
         parsed = urlparse(JsonParser.ensure_full_url(post_path))
         requested_ids = []
@@ -1415,9 +1749,12 @@ class JsonParser:
             if post_id:
                 requested_ids.append(post_id)
 
+        video_id = JsonParser.get_terminal_video_id(post_path)
+        if video_id:
+            requested_ids.append(video_id)
+
         for pattern in (
             r'/reel/([^/?]+)',
-            r'/videos/(?:pcb\.\d+/)?([^/?]+)',
             r'/watch/([^/?]+)',
             r'(?<!share)/v/(\d+)(?:/|$)',
             r'/permalink/([^/?]+)',
@@ -1432,10 +1769,31 @@ class JsonParser:
     def get_target_ids(
         html_parser: BeautifulSoup,
         post_path: str,
+        response_url: str | None = None,
     ) -> tuple[list[str], list[str]]:
         raw_ids = JsonParser.get_requested_ids(post_path)
         route_proven_ids: list[str] = []
+        used_post_to_video_alias = False
         source_is_share = Utils.is_share_path(post_path)
+        blocks = JsonParser.get_json_blocks(html_parser)
+
+        selected_response = cffi.selected_get_response
+        if response_url is None and selected_response is not None:
+            response_url = str(getattr(selected_response, 'url', '') or '')
+        response_url = str(response_url or '')
+        response_ids = JsonParser.get_requested_ids(response_url)
+        response_history = (
+            getattr(selected_response, 'history', None)
+            if selected_response is not None else None
+        )
+        response_was_redirected = bool(response_history)
+
+        canonical_urls = JsonParser.get_declared_urls(
+            html_parser, property_name='canonical'
+        )
+        og_urls = JsonParser.get_declared_urls(
+            html_parser, property_name='og:url'
+        )
 
         def add(value, target: list[str]) -> None:
             if isinstance(value, (str, int)) and str(value) and str(value) not in target:
@@ -1447,15 +1805,64 @@ class JsonParser:
 
         source_share_key = share_key(post_path) if source_is_share else ''
 
-        for block in JsonParser.get_json_blocks(html_parser):
-            route_info = Jq.first(block, 'initialRouteInfo')
-            route = route_info.get('route') if isinstance(route_info, dict) else None
-            if not isinstance(route, dict):
+        def media_links_source_to_target(candidate_id: str) -> bool:
+            for block in blocks:
+                for media in Jq.all(block, 'media'):
+                    if not isinstance(media, dict):
+                        continue
+                    if candidate_id not in JsonParser.direct_video_identity_ids(
+                        media
+                    ):
+                        continue
+                    creation_story = media.get('creation_story')
+                    if not isinstance(creation_story, dict):
+                        continue
+                    comet_sections = creation_story.get('comet_sections')
+                    title = (
+                        comet_sections.get('title')
+                        if isinstance(comet_sections, dict) else None
+                    )
+                    story = title.get('story') if isinstance(title, dict) else None
+                    post_id = story.get('post_id') if isinstance(story, dict) else None
+                    if isinstance(post_id, (str, int)) and str(post_id) in raw_ids:
+                        return True
+            return False
+
+        def declared_url_consensus(urls: list[str], target_id: str) -> bool:
+            return bool(urls) and all(
+                Utils.is_facebook_url(url, require_https=True)
+                and set(JsonParser.get_requested_ids(url)) == {target_id}
+                for url in urls
+            )
+
+        def redirect_provenance_matches_source() -> bool:
+            if (
+                selected_response is None
+                or not response_history
+                or response_url
+                != str(getattr(selected_response, 'url', '') or '')
+            ):
+                return False
+            first_hop_url = str(
+                getattr(response_history[0], 'url', '') or ''
+            )
+            return bool(
+                Utils.is_facebook_url(first_hop_url, require_https=True)
+                and '/posts/' in urlparse(first_hop_url).path.lower()
+                and set(raw_ids).intersection(
+                    JsonParser.get_requested_ids(first_hop_url)
+                )
+            )
+
+        for route in JsonParser.get_initial_routes(blocks):
+            route_name = str(route.get('canonicalRouteName', ''))
+            route_url = str(route.get('url', ''))
+            if (
+                route_name not in JsonParser.CONTENT_ROUTE_NAMES
+                and not Utils.is_post_like_path(route_url)
+            ):
                 continue
-            route_name = str(route.get('canonicalRouteName', '')).lower()
-            if not any(marker in route_name for marker in ('post', 'video', 'reel', 'photo')):
-                continue
-            route_ids = JsonParser.get_requested_ids(str(route.get('url', '')))
+            route_ids = JsonParser.get_requested_ids(route_url)
 
             candidate_ids: list[str] = []
             for value in route_ids:
@@ -1463,9 +1870,12 @@ class JsonParser:
 
             params = route.get('params')
             route_share_keys: list[str] = []
+            route_param_ids: set[str] = set()
             if isinstance(params, dict):
                 for key in ('story_token', 'story_fbid', 'fbid', 'video_id', 'v', 'post_id'):
                     add(params.get(key), candidate_ids)
+                    if params.get(key) not in (None, ''):
+                        route_param_ids.add(str(params[key]))
                 if params.get('share_url'):
                     route_share_keys.append(share_key(str(params['share_url'])))
 
@@ -1490,13 +1900,106 @@ class JsonParser:
                 and candidate_ids
                 and source_share_key in route_share_keys
             )
-            if not route_matches_request and not opaque_share_target:
+            final_id_set = {
+                value for value in response_ids
+                if value.isdigit()
+            }
+            final_video_id = (
+                next(iter(final_id_set))
+                if len(final_id_set) == 1 else None
+            )
+            declared_final_target = bool(
+                final_video_id
+                and set(route_ids) == {final_video_id}
+                and route_param_ids
+                and route_param_ids == {final_video_id}
+                and declared_url_consensus(canonical_urls, final_video_id)
+                and declared_url_consensus(og_urls, final_video_id)
+            )
+            direct_loe_target = (
+                next(iter(set(route_ids)))
+                if (
+                    route_name
+                    == 'comet.fbweb.CometVideoHomeLOEVideoPermalinkRoute'
+                    and len(set(route_ids)) == 1
+                    and route_param_ids == set(route_ids)
+                )
+                else None
+            )
+            direct_loe_consensus = bool(
+                direct_loe_target
+                and set(raw_ids) == {direct_loe_target}
+                and (
+                    not response_url
+                    or Utils.is_facebook_url(
+                        response_url, require_https=True
+                    )
+                )
+                and (
+                    not response_ids
+                    or set(response_ids) == {direct_loe_target}
+                )
+                and declared_url_consensus(
+                    canonical_urls, str(direct_loe_target)
+                )
+                and declared_url_consensus(og_urls, str(direct_loe_target))
+                and JsonParser.has_target_video_delivery(
+                    blocks, [str(direct_loe_target)]
+                )
+            )
+            if (
+                route_name
+                == 'comet.fbweb.CometVideoHomeLOEVideoPermalinkRoute'
+                and route_matches_request
+                and not direct_loe_consensus
+            ):
+                route_matches_request = False
+            raw_ids_are_pfbids = bool(raw_ids) and all(
+                value.lower().startswith('pfbid') for value in raw_ids
+            )
+            post_to_video_alias = bool(
+                not source_is_share
+                and raw_ids
+                and '/posts/' in urlparse(
+                    JsonParser.ensure_full_url(post_path)
+                ).path.lower()
+                and response_was_redirected
+                and redirect_provenance_matches_source()
+                and Utils.is_facebook_url(response_url, require_https=True)
+                and '/videos/' in urlparse(response_url).path.lower()
+                and route_name
+                == 'comet.fbweb.CometVideoHomeLOEVideoPermalinkRoute'
+                and declared_final_target
+                and JsonParser.has_target_video_delivery(
+                    blocks, [str(final_video_id)]
+                )
+                and (
+                    raw_ids_are_pfbids
+                    or media_links_source_to_target(str(final_video_id))
+                )
+            )
+            if not (
+                route_matches_request
+                or opaque_share_target
+                or post_to_video_alias
+            ):
                 continue
-            for value in candidate_ids:
-                add(value, route_proven_ids)
+            if post_to_video_alias:
+                used_post_to_video_alias = True
+                add(final_video_id, route_proven_ids)
+            elif direct_loe_consensus:
+                add(direct_loe_target, route_proven_ids)
+            else:
+                for value in candidate_ids:
+                    add(value, route_proven_ids)
 
+        selection_ids = (
+            route_proven_ids
+            if used_post_to_video_alias
+            else list(dict.fromkeys([*route_proven_ids, *raw_ids]))
+        )
         return (
-            list(dict.fromkeys([*route_proven_ids, *raw_ids])),
+            selection_ids,
             route_proven_ids,
         )
 
@@ -1581,181 +2084,265 @@ class JsonParser:
         return None
 
     @staticmethod
-    def probe_page_type(html_parser: BeautifulSoup, post_path: str = '') -> str:
+    def probe_page_type(
+        html_parser: BeautifulSoup,
+        post_path: str = '',
+        response_url: str | None = None,
+    ) -> str:
         blocks = JsonParser.get_json_blocks(html_parser)
-        initial_routes = []
-        for block in blocks:
-            route_info = Jq.first(block, 'initialRouteInfo')
-            if isinstance(route_info, dict) and isinstance(route_info.get('route'), dict):
-                initial_routes.append(route_info['route'])
-        if any(
-            route.get('canonicalRouteName')
-            == 'comet.fbweb.CometVideoHomeVideoNotFoundRoute'
-            for route in initial_routes
-        ):
-            return 'no_data'
+        routes = JsonParser.get_initial_routes(blocks)
+        route_names = {
+            str(route.get('canonicalRouteName', '')) for route in routes
+        }
+        if response_url is None and cffi.selected_get_response is not None:
+            response_url = str(
+                getattr(cffi.selected_get_response, 'url', '') or ''
+            )
+        response_url = str(response_url or '')
+        raw_ids = JsonParser.get_requested_ids(post_path)
+        target_ids, route_ids = JsonParser.get_target_ids(
+            html_parser, post_path, response_url=response_url
+        )
+        required_ids = route_ids or raw_ids or target_ids
+        canonical_urls = JsonParser.get_declared_urls(
+            html_parser, property_name='canonical'
+        )
+        og_urls = JsonParser.get_declared_urls(
+            html_parser, property_name='og:url'
+        )
 
-        if any(
-            route.get('canonicalRouteName')
-            == 'comet.fbweb.CometProfilePlusLoggedOutRoute'
-            for route in initial_routes
-        ):
-            return 'no_data'
+        unsupported_routes = {
+            'comet.fbweb.CometProfilePlusLoggedOutRoute':
+                JsonParser.PROBE_UNSUPPORTED_PROFILE,
+            'comet.fbweb.CometProfileLoggedOutRoute':
+                JsonParser.PROBE_UNSUPPORTED_PROFILE,
+            'comet.fbweb.CometMarketplaceHoistedPermalinkRoute':
+                JsonParser.PROBE_UNSUPPORTED_MARKETPLACE,
+            'comet.fbweb.CometProfileLegacyAlbumViewRoute':
+                JsonParser.PROBE_UNSUPPORTED_MEDIA_SET,
+        }
+        for route_name, result in unsupported_routes.items():
+            if route_name in route_names:
+                return result
 
-        has_profile_app_link = any(
-            str(meta.get('property', '')).lower() in {'al:android:url', 'al:ios:url'}
-            and str(meta.get('content', '')).lower().startswith('fb://profile/')
-            for meta in html_parser.find_all('meta')
-        )
-        if has_profile_app_link:
-            canonical = html_parser.find('link', attrs={'rel': 'canonical'})
-            canonical_path = urlparse(canonical.get('href', '')).path if canonical else ''
-            path = canonical_path or urlparse(JsonParser.ensure_full_url(post_path)).path
-            post_like = bool(re.search(
-                r'/(?:posts|permalink\.php|story\.php|photo(?:\.php)?|reel|watch|videos|v)(?:/|$)',
-                path,
-                re.IGNORECASE,
-            ))
-            profile_root = bool(
-                re.match(r'^/people/[^/]+/\d+/?$', path, re.IGNORECASE)
-                or (
-                    len([part for part in path.split('/') if part]) == 1
-                    and not post_like
-                )
-            )
-            profile_target_ids, profile_route_ids = JsonParser.get_target_ids(
-                html_parser, post_path
-            )
-            profile_required_ids = (
-                profile_route_ids
-                or JsonParser.get_requested_ids(post_path)
-                or profile_target_ids
-            )
-            has_target_post_data = bool(profile_required_ids) and any(
-                JsonParser.contains_exact_id(block, profile_required_ids)
-                and any(
-                    Jq.has(block, marker)
-                    for marker in (
-                        'i18n_reaction_count',
-                        'short_form_video_context',
-                        'message_preferred_body',
-                        'prefetch_uris_v2',
-                        'attached_comment',
-                        'comment_rendering_instance',
-                        'creation_story',
-                        'browser_native_hd_url',
-                        'browser_native_sd_url',
-                    )
-                )
-                for block in blocks
-            )
-            if profile_root and not has_target_post_data:
-                return 'no_data'
-
-        has_generic_data = any(
-            Jq.has(block, 'i18n_reaction_count') or Jq.has(block, 'short_form_video_context')
-            for block in blocks
-        )
-        has_photo_data = (
-            any(Jq.has(block, 'message_preferred_body', 'container_story') for block in blocks)
-            and any(Jq.has(block, 'prefetch_uris_v2') for block in blocks)
-        )
-        has_photocom_data = (
-            any(Jq.has(block, 'attached_comment') and not Jq.has(block, 'unified_reactors') for block in blocks)
-            and any(Jq.has(block, 'attached_comment', 'unified_reactors') for block in blocks)
-        )
-        has_watch_data = any(
-            Jq.has(block, 'comment_rendering_instance', 'video_view_count_renderer')
-            for block in blocks
-        )
-        has_reel_data = (
-            any(Jq.has(block, 'creation_story') or Jq.has(block, 'short_form_video_context') for block in blocks)
-            and any(
-                Jq.has(block, 'browser_native_hd_url') or Jq.has(block, 'browser_native_sd_url')
-                for block in blocks
-            )
-        )
-        parsed_url = urlparse(JsonParser.ensure_full_url(post_path))
-        parsed_path = parsed_url.path
-        is_photo_route = bool(re.match(r'^/?photo(?:\.php)?/?$', parsed_path, re.IGNORECASE))
-        is_watch_route = bool(re.match(r'^/?watch(?:/|$)', parsed_path, re.IGNORECASE))
-        is_reel_route = bool(
-            re.match(r'^/?reel(?:/|$)', parsed_path, re.IGNORECASE)
-            or re.search(r'(?:^|/)videos/', parsed_path, re.IGNORECASE)
-            or re.search(r'(?:^|/)(?:[^/]+/)?v/\d+(?:/|$)', parsed_path, re.IGNORECASE)
-        )
-        is_photocom_route = '3' in parse_qs(parsed_url.query).get('type', [])
-
-        def block_has_route_data(block: dict) -> bool:
-            if Jq.has(block, 'i18n_reaction_count') or Jq.has(block, 'short_form_video_context'):
-                return True
-            if is_photo_route and (
-                Jq.has(block, 'message_preferred_body', 'container_story')
-                or Jq.has(block, 'prefetch_uris_v2')
-            ):
-                return True
-            if is_photocom_route and Jq.has(block, 'attached_comment'):
-                return True
-            if is_watch_route and Jq.has(
-                block, 'comment_rendering_instance', 'video_view_count_renderer'
-            ):
-                return True
-            if is_reel_route and (
-                Jq.has(block, 'creation_story')
-                or Jq.has(block, 'browser_native_hd_url')
-                or Jq.has(block, 'browser_native_sd_url')
-            ):
-                return True
+        def has_private_group_surface() -> bool:
+            for block in blocks:
+                for group in Jq.all(block, 'group'):
+                    if not isinstance(group, dict):
+                        continue
+                    join_states = {
+                        str(group.get('viewer_join_state', '')),
+                        str(group.get('viewer_forum_join_state', '')),
+                    }
+                    privacy = group.get('privacy_info')
+                    title = Jq.first(privacy, 'text') if isinstance(privacy, dict) else None
+                    if (
+                        join_states.intersection({
+                            'CANNOT_JOIN', 'CANNOT_JOIN_OR_REQUEST'
+                        })
+                        and title == 'Private group'
+                    ):
+                        return True
             return False
 
-        def has_requested_route_data(requested_ids: list[str]) -> bool:
-            return bool(requested_ids) and any(
-                block_has_route_data(block)
-                and JsonParser.contains_exact_id(block, requested_ids)
-                for block in blocks
+        def reel_content_state(reel_id: str) -> tuple[bool, bool]:
+            has_context = False
+            has_missing_stub = False
+            for block in blocks:
+                for story in Jq.all(block, 'creation_story'):
+                    if (
+                        isinstance(story, dict)
+                        and JsonParser.contains_exact_id(story, [reel_id])
+                    ):
+                        has_context = True
+                for video in Jq.all(block, 'video'):
+                    if (
+                        isinstance(video, dict)
+                        and reel_id
+                        in JsonParser.direct_video_identity_ids(video)
+                        and 'creation_story' in video
+                        and video.get('creation_story') is None
+                    ):
+                        has_missing_stub = True
+                for context in Jq.all(block, 'short_form_video_context'):
+                    if not isinstance(context, dict):
+                        continue
+                    for key in ('video', 'playback_video'):
+                        video = context.get(key)
+                        if (
+                            isinstance(video, dict)
+                            and reel_id
+                            in JsonParser.direct_video_identity_ids(video)
+                        ):
+                            has_context = True
+                    shareable_url = context.get('shareable_url')
+                    if (
+                        isinstance(shareable_url, str)
+                        and reel_id
+                        in JsonParser.get_requested_ids(shareable_url)
+                    ):
+                        has_context = True
+            return has_context, has_missing_stub
+
+        def reel_consensus_id() -> str | None:
+            reel_routes = [
+                route for route in routes
+                if route.get('canonicalRouteName')
+                == 'comet.fbweb.CometFBReelsRoute'
+            ]
+            if len(reel_routes) != 1:
+                return None
+            route = reel_routes[0]
+            route_ids = set(JsonParser.get_requested_ids(str(route.get('url', ''))))
+            params = route.get('params')
+            param_id = (
+                str(params.get('video_id'))
+                if isinstance(params, dict) and params.get('video_id') else ''
             )
+            if len(route_ids) != 1 or not param_id or route_ids != {param_id}:
+                return None
+            requested_id_set = set(raw_ids)
+            selected_id_set = set(JsonParser.get_requested_ids(response_url))
+            if (
+                (requested_id_set and requested_id_set != {param_id})
+                or (selected_id_set and selected_id_set != {param_id})
+                or not (requested_id_set or selected_id_set)
+            ):
+                return None
+            if not canonical_urls or not og_urls:
+                return None
+            for urls in (canonical_urls, og_urls):
+                if not all(
+                    Utils.is_facebook_url(url, require_https=True)
+                    and set(JsonParser.get_requested_ids(url)) == {param_id}
+                    for url in urls
+                ):
+                    return None
+            return param_id
 
-        requested_ids = JsonParser.get_requested_ids(post_path)
-        has_route_data = has_generic_data
-        if is_photo_route:
-            has_route_data = has_route_data or has_photo_data
-        if is_photocom_route:
-            has_route_data = has_route_data or has_photocom_data
-        if is_watch_route:
-            has_route_data = has_route_data or has_watch_data
-        if is_reel_route:
-            has_route_data = has_route_data or has_reel_data
-        if Utils.is_share_path(post_path):
-            has_route_data = (
-                has_route_data
-                or has_photo_data
-                or has_photocom_data
-                or has_watch_data
-                or has_reel_data
+        declared_urls = [*canonical_urls, *og_urls]
+        auth_wall = bool(
+            _cookie_probe_blocked_reason(response_url, '', html_parser)
+            or (
+                declared_urls
+                and all(
+                    Utils.is_control_path(
+                        url, 'login', 'checkpoint', 'recover'
+                    )
+                    for url in declared_urls
+                )
             )
-        canonical = html_parser.find('link', attrs={'rel': 'canonical'})
-        if canonical and urlparse(canonical.get('href', '')).path.rstrip('/') == '/watch':
-            if has_requested_route_data(requested_ids):
-                return 'has_data'
-            if Utils.is_share_path(post_path) and has_route_data:
-                return 'has_data'
-            return 'no_data'
+        )
 
-        if canonical and re.search(r'/login\b', canonical.get('href', '')):
-            if has_requested_route_data(requested_ids):
-                return 'has_data'
-            return 'login_wall'
+        if 'comet.fbweb.CometVideoHomeVideoNotFoundRoute' in route_names:
+            return JsonParser.PROBE_TARGET_NOT_FOUND
 
-        if has_route_data:
-            return 'has_data'
-        
-        return 'no_data'
+        if 'comet.fbweb.CometGroupAboutRoute' in route_names:
+            canonical_about = any(
+                len(Utils.facebook_path_segments(url)) >= 3
+                and Utils.facebook_path_segments(url)[0].casefold() == 'groups'
+                and Utils.facebook_path_segments(url)[-1].casefold() == 'about'
+                for url in canonical_urls
+            )
+            if (
+                any(
+                    Utils.is_post_like_path(path)
+                    for path in (post_path, response_url) if path
+                )
+                and canonical_about
+                and has_private_group_surface()
+                and not JsonParser.has_bounded_target_payload(
+                    blocks, required_ids
+                )
+            ):
+                return JsonParser.PROBE_PRIVATE_GROUP
+
+        if (
+            'comet.fbweb.CometVideoHomeLOEVideoPermalinkRoute' in route_names
+            and not route_ids
+            and (
+                raw_ids
+                or Utils.is_post_like_path(post_path)
+            )
+        ):
+            return JsonParser.PROBE_TARGET_IDENTITY_MISMATCH
+
+        if 'comet.fbweb.CometFBReelsRoute' in route_names:
+            reel_id = reel_consensus_id()
+            has_context, has_missing_stub = (
+                reel_content_state(reel_id) if reel_id else (False, False)
+            )
+            has_delivery = bool(
+                reel_id
+                and JsonParser.has_target_video_delivery(blocks, [reel_id])
+            )
+            if has_context and has_delivery:
+                return JsonParser.PROBE_HAS_DATA
+            if auth_wall:
+                return JsonParser.PROBE_LOGIN_WALL
+            if has_missing_stub and not has_context and not has_delivery:
+                return JsonParser.PROBE_TARGET_VIDEO_MISSING
+            if (
+                not reel_id
+                and Utils.is_post_like_path(post_path)
+                and (
+                    route_ids
+                    or raw_ids
+                    or JsonParser.get_requested_ids(response_url)
+                )
+            ):
+                return JsonParser.PROBE_TARGET_IDENTITY_MISMATCH
+
+        if JsonParser.has_bounded_target_payload(blocks, required_ids):
+            return JsonParser.PROBE_HAS_DATA
+        if auth_wall:
+            return JsonParser.PROBE_LOGIN_WALL
+        return JsonParser.PROBE_UNKNOWN
 
     @staticmethod
-    def check_page_or_raise(html_parser: BeautifulSoup, post_path: str):
-        page_type = JsonParser.probe_page_type(html_parser, post_path)
-        if page_type in ('login_wall', 'no_data'):
-            raise NoDataException(f'Facebook served a login wall or empty page for {post_path} - content requires authentication')
+    def raise_for_probe_result(page_type: str, post_path: str) -> None:
+        unsupported_messages = {
+            JsonParser.PROBE_UNSUPPORTED_PROFILE:
+                'Facebook share target is a profile rather than a post',
+            JsonParser.PROBE_UNSUPPORTED_MARKETPLACE:
+                'Facebook share target is a Marketplace listing',
+            JsonParser.PROBE_UNSUPPORTED_MEDIA_SET:
+                'Facebook share target is a media-set album',
+        }
+        if page_type in unsupported_messages:
+            raise UnsupportedRouteException(
+                unsupported_messages[page_type], reason_code=page_type
+            )
+        messages = {
+            JsonParser.PROBE_LOGIN_WALL:
+                f'Facebook served a login wall for {post_path}',
+            JsonParser.PROBE_PRIVATE_GROUP:
+                f'Facebook served a private group landing without the requested post for {post_path}',
+            JsonParser.PROBE_TARGET_VIDEO_MISSING:
+                f'Facebook response has no target-local playable video for {post_path}',
+            JsonParser.PROBE_TARGET_NOT_FOUND:
+                f'Facebook reported that the requested target was not found for {post_path}',
+            JsonParser.PROBE_TARGET_IDENTITY_MISMATCH:
+                f'Facebook route identities disagree for {post_path}',
+            JsonParser.PROBE_NO_DATA:
+                f'Facebook response did not contain target data for {post_path}',
+        }
+        if page_type in messages:
+            raise NoDataException(
+                messages[page_type], reason_code=page_type, terminal=True
+            )
+
+    @staticmethod
+    def check_page_or_raise(
+        html_parser: BeautifulSoup,
+        post_path: str,
+        response_url: str | None = None,
+    ) -> str:
+        page_type = JsonParser.probe_page_type(
+            html_parser, post_path, response_url=response_url
+        )
+        JsonParser.raise_for_probe_result(page_type, post_path)
+        return page_type
 
     @staticmethod
     @contextmanager
@@ -1775,37 +2362,45 @@ class JsonParser:
 
         def prepare_page(current_response: CffiResponse):
             cffi.select_response(current_response)
+            current_url = str(getattr(current_response, 'url', '') or '')
+            if current_url and not Utils.is_facebook_url(
+                current_url, require_https=True
+            ):
+                raise UnsupportedRouteException(
+                    'Facebook redirected outside Facebook',
+                    reason_code='offsite_redirect',
+                )
             current_html = current_response.text
             current_parser = BeautifulSoup(current_html, 'html.parser')
-            JsonParser.check_page_or_raise(current_parser, post_path)
-            return current_html, current_parser
+            page_type = JsonParser.probe_page_type(
+                current_parser,
+                post_path,
+                response_url=current_url,
+            )
+            return current_html, current_parser, page_type
 
-        try:
-            raw_html, html_parser = prepare_page(http_response)
-        except NoDataException:
-            if owns_response and http_response.status_code in cffi.retry_statuses:
-                http_response = cffi.get(
-                    url,
-                    _check_status=False,
-                    _retry_status_responses=False,
-                    _bypass_cache=True,
-                )
-                try:
-                    raw_html, html_parser = prepare_page(http_response)
-                except NoDataException:
-                    if http_response.status_code >= 400:
-                        raise UpstreamException(
-                            f'Facebook returned HTTP {http_response.status_code} for {url}',
-                            http_response,
-                        )
-                    raise
-            elif http_response.status_code >= 400:
-                raise UpstreamException(
-                    f'Facebook returned HTTP {http_response.status_code} for {url}',
-                    http_response,
-                )
-            else:
-                raise
+        raw_html, html_parser, page_type = prepare_page(http_response)
+        if (
+            owns_response
+            and http_response.status_code in cffi.retry_statuses
+            and page_type != JsonParser.PROBE_HAS_DATA
+        ):
+            http_response = cffi.get(
+                url,
+                _check_status=False,
+                _retry_status_responses=False,
+                _bypass_cache=True,
+            )
+            raw_html, html_parser, page_type = prepare_page(http_response)
+        if (
+            http_response.status_code >= 400
+            and page_type != JsonParser.PROBE_HAS_DATA
+        ):
+            raise UpstreamException(
+                f'Facebook returned HTTP {http_response.status_code} for {url}',
+                http_response,
+            )
+        JsonParser.raise_for_probe_result(page_type, post_path)
         try:
             yield html_parser
         except ParseException as e:
@@ -1821,18 +2416,34 @@ class JsonParser:
         requested_ids: list[str] | None = None,
         required_ids: list[str] | None = None,
     ) -> dict:
-        candidate_blocks = []
         blocks = JsonParser.get_json_blocks(html_parser)
+        requested_ids = (
+            JsonParser.get_requested_ids(post_path)
+            if requested_ids is None else requested_ids
+        )
+        required_ids = required_ids or []
+        candidate_blocks = []
         for bloc in blocks:
-            if Jq.has(bloc, 'i18n_reaction_count') or Jq.has(bloc, 'short_form_video_context'):
-                candidate_blocks.append(bloc)
+            try:
+                root = JsonParser.get_root_node(bloc, requested_ids)
+            except ParseException:
+                continue
+            if required_ids and not JsonParser.contains_target_id(root, required_ids):
+                continue
+            candidate_blocks.append(bloc)
 
         if not candidate_blocks:
-            for bloc in blocks:
-                if 'video' in str(bloc) and 'short_form_video_context' in str(bloc):
-                    candidate_blocks.append(bloc)
-                    
-        if not candidate_blocks:
+            if required_ids:
+                if JsonParser.has_bounded_target_payload(
+                    blocks, required_ids
+                ):
+                    raise ParseException(
+                        'Facebook target payload shape is unsupported'
+                    )
+                raise NoDataException(
+                    'Facebook response did not contain the requested post',
+                    reason_code='target_payload_missing',
+                )
             raise ParseException('cannot find post json')
 
         def score_block(bloc: dict) -> int:
@@ -1865,11 +2476,6 @@ class JsonParser:
                 score -= 10
             return score
 
-        requested_ids = (
-            JsonParser.get_requested_ids(post_path)
-            if requested_ids is None else requested_ids
-        )
-        required_ids = required_ids or []
         candidate_blocks.sort(
             key=lambda block: (
                 JsonParser.contains_target_id(block, required_ids),
@@ -1888,7 +2494,14 @@ class JsonParser:
             except ParseException:
                 continue
         if required_ids:
-            raise NoDataException('Facebook response did not contain the requested post')
+            if JsonParser.has_bounded_target_payload(blocks, required_ids):
+                raise ParseException(
+                    'Facebook target payload shape is unsupported'
+                )
+            raise NoDataException(
+                'Facebook response did not contain the requested post',
+                reason_code='target_payload_missing',
+            )
         return candidate_blocks[0]
 
     @staticmethod
@@ -2207,6 +2820,18 @@ class JsonParser:
         with page as html_parser:
             raw_ids = JsonParser.get_requested_ids(post_path)
             requested_ids, route_proven_ids = JsonParser.get_target_ids(html_parser, post_path)
+            effective_post_path = post_path
+            if (
+                raw_ids
+                and route_proven_ids
+                and not set(raw_ids).intersection(route_proven_ids)
+                and cffi.selected_get_response is not None
+            ):
+                selected_url = str(
+                    getattr(cffi.selected_get_response, 'url', '') or ''
+                )
+                if Utils.facebook_path_segments(selected_url):
+                    effective_post_path = selected_url
             if Utils.is_share_path(post_path) and not raw_ids and not route_proven_ids:
                 raise NoDataException(
                     'Facebook response did not identify the requested share post'
@@ -2262,7 +2887,9 @@ class JsonParser:
                     pass
 
             story = Story(story_dict)
-            parsed_post_path = urlparse(JsonParser.ensure_full_url(post_path)).path
+            parsed_post_path = urlparse(
+                JsonParser.ensure_full_url(effective_post_path)
+            ).path
             if not story.video_links and re.search(
                 r'/(?:reel|watch|videos|v)(?:/|$)', parsed_post_path, re.IGNORECASE
             ):
@@ -2320,7 +2947,7 @@ class JsonParser:
             elif story.url and story_url_ids.intersection(validated_identity_ids):
                 post_url = story.url or JsonParser.ensure_full_url(post_path)
             else:
-                post_url = JsonParser.ensure_full_url(post_path)
+                post_url = JsonParser.ensure_full_url(effective_post_path)
             post_content = story.get_text()
             post_group_name = JsonParser.get_group_name(html_parser, requested_ids)
             post_author_name = story.author_name
@@ -2589,7 +3216,7 @@ class ReelsParser:
             for key in ['browser_native_hd_url', 'browser_native_sd_url']:
                 try:
                     video_link = Jq.first(video_node, key)
-                    if not video_link:
+                    if not video_link or not Utils.is_safe_media_url(str(video_link)):
                         continue
                     return str(video_link)
                 except StopIteration:
@@ -2599,24 +3226,19 @@ class ReelsParser:
         if user_node:
             return work_node(user_node)
 
-        candidates = []
-        for bloc in JsonParser.get_json_blocks(html_parser):
-            candidates.extend(
-                node for node in [bloc, *Jq.enumerate(bloc)]
-                if Jq.first(node, 'browser_native_hd_url') or Jq.first(node, 'browser_native_sd_url')
-            )
+        candidates = JsonParser.get_video_delivery_nodes(
+            JsonParser.get_json_blocks(html_parser)
+        )
 
         requested_ids = requested_ids or []
+        requested_id_set = set(map(str, requested_ids))
         matching = [
             node for node in candidates
-            if JsonParser.contains_exact_id(node, requested_ids)
+            if requested_id_set.intersection(
+                JsonParser.direct_video_identity_ids(node)
+            )
         ]
-        if not matching:
-            matching = [
-                node for node in candidates
-                if JsonParser.contains_target_id(node, requested_ids)
-            ]
-        for node in sorted(matching, key=lambda item: len(str(item))):
+        for node in matching:
             try:
                 return work_node(node)
             except (ParseException, KeyError, TypeError, IndexError):
@@ -2938,6 +3560,39 @@ def format_error_message_embed(original_url: str) -> str:
 </html>''')
 
 
+def failed_post_type(path: str, upstream_response: CffiResponse | None, reason: str) -> str:
+    if reason.startswith('unsupported_') and reason.endswith('_target'):
+        return reason.removeprefix('unsupported_').removesuffix('_target').replace('media_set', 'album')
+    if reason == 'private_group_post_unavailable':
+        return 'group_post'
+    if reason == 'target_video_payload_missing':
+        return 'reel'
+    paths = [path]
+    if upstream_response is not None:
+        paths.insert(0, str(upstream_response.url))
+    for candidate in paths:
+        parts = Utils.facebook_path_segments(candidate)
+        if not parts or Utils.is_control_path(candidate, 'login', 'checkpoint', 'recover'):
+            continue
+        if parts[0] == 'groups':
+            return 'group_post'
+        if parts[0] == 'share':
+            return 'share'
+        kinds = {
+            'reel': 'reel', 'videos': 'video', 'watch': 'video', 'v': 'video',
+            'posts': 'post', 'permalink': 'post', 'story.php': 'post',
+            'permalink.php': 'post', 'photo.php': 'photo', 'photo': 'photo',
+            'photos': 'photo', 'marketplace': 'marketplace', 'media': 'album',
+        }
+        if parts[0] in kinds:
+            return kinds[parts[0]]
+        if len(parts) > 1 and parts[1] in {'posts', 'videos', 'photos', 'v'}:
+            return kinds[parts[1]]
+        if len(parts) == 1 or parts[0] in {'people', 'p'}:
+            return 'profile'
+    return 'unknown'
+
+
 def is_facebook_url(url: str) -> bool:
     if urlparse(url).netloc:
         url = Utils.normalize_facebook_path(url)
@@ -3068,6 +3723,10 @@ ROUTE_FALLBACK_EXCEPTIONS = PARSER_FALLBACK_EXCEPTIONS + (UpstreamException,)
 
 
 def _allow_route_upstream_fallback(error: Exception) -> bool:
+    if isinstance(error, UnsupportedRouteException):
+        return False
+    if isinstance(error, NoDataException) and getattr(error, 'terminal', False):
+        return False
     return not isinstance(error, UpstreamException) or error.status_code in {
         403, 404, 500, 502, 503, 504,
     }
@@ -3082,6 +3741,15 @@ def _as_parser_error(error: Exception) -> FacebedException:
 def _prefer_parser_error(first: Exception, second: Exception) -> FacebedException:
     first = _as_parser_error(first)
     second = _as_parser_error(second)
+    for error in (first, second):
+        if isinstance(error, UnsupportedRouteException):
+            return error
+    for error in (first, second):
+        if (
+            isinstance(error, NoDataException)
+            and getattr(error, 'reason_code', 'no_data') != 'no_data'
+        ):
+            return error
     if isinstance(second, ParseException) and second.html:
         return second
     if isinstance(first, ParseException) and first.html:
@@ -3093,6 +3761,8 @@ def _parse_with_generic(parser, post_path: str, http_response: CffiResponse | No
     try:
         return _invoke_parser(parser, post_path, http_response)
     except PARSER_FALLBACK_EXCEPTIONS as first_error:
+        if not _allow_route_upstream_fallback(first_error):
+            raise
         try:
             return _invoke_parser(JsonParser.process_post, post_path, http_response)
         except PARSER_FALLBACK_EXCEPTIONS as second_error:
@@ -3101,31 +3771,38 @@ def _parse_with_generic(parser, post_path: str, http_response: CffiResponse | No
 
 def _parse_video_path(post_path: str, http_response: CffiResponse | None = None) -> ParsedPost:
     parsed = urlparse(post_path)
-    search = re.search(
-        r'(?:^|/)(?:videos/(?:pcb\.\d+/)?|v/)(\d+)', parsed.path, re.IGNORECASE
-    )
-    if not search:
-        search = re.search(r'(?:^|/)[^/]+/v/(\d+)', parsed.path, re.IGNORECASE)
-    if not search:
+    video_id = JsonParser.get_terminal_video_id(post_path)
+    if not video_id:
+        search = re.search(
+            r'(?:^|/)(?:[^/]+/)?v/(\d+)(?:/|$)',
+            parsed.path,
+            re.IGNORECASE,
+        )
+        video_id = search.group(1) if search else None
+    if not video_id:
         return _invoke_parser(JsonParser.process_post, post_path, http_response)
 
-    video_id = search.group(1)
-    reel_path = f'reel/{video_id}'
-    if parsed.query:
-        reel_path += f'?{parsed.query}'
+    path_parts = [part for part in parsed.path.split('/') if part]
+    videos_index = next(
+        (
+            index for index, part in enumerate(path_parts)
+            if part.casefold() == 'videos'
+        ),
+        None,
+    )
+    video_parts = (
+        path_parts[videos_index + 1:]
+        if videos_index is not None else []
+    )
+    slugged_video_path = bool(
+        len(video_parts) >= 2
+        and not video_parts[0].casefold().startswith('pcb.')
+    )
+
     original_response = http_response
-    reel_response = http_response
-    if http_response is not None:
-        final_path = Utils.normalize_facebook_path(str(getattr(http_response, 'url', '')))
-        if urlparse(final_path).path.rstrip('/') != urlparse(reel_path).path.rstrip('/'):
-            reel_response = None
-    try:
-        return _invoke_parser(ReelsParser.process_post, reel_path, reel_response)
-    except ROUTE_FALLBACK_EXCEPTIONS as reel_error:
-        if not _allow_route_upstream_fallback(reel_error):
-            raise
-        generic_post = None
-        generic_error = None
+    generic_post = None
+    generic_error = None
+    if slugged_video_path:
         try:
             generic_post = _invoke_parser(
                 JsonParser.process_post, post_path, original_response
@@ -3136,6 +3813,31 @@ def _parse_video_path(post_path: str, http_response: CffiResponse | None = None)
             generic_error = error
             if not _allow_route_upstream_fallback(error):
                 raise
+
+    reel_path = f'reel/{video_id}'
+    if parsed.query:
+        reel_path += f'?{parsed.query}'
+    reel_response = http_response
+    if http_response is not None:
+        final_path = Utils.normalize_facebook_path(str(getattr(http_response, 'url', '')))
+        if urlparse(final_path).path.rstrip('/') != urlparse(reel_path).path.rstrip('/'):
+            reel_response = None
+    try:
+        return _invoke_parser(ReelsParser.process_post, reel_path, reel_response)
+    except ROUTE_FALLBACK_EXCEPTIONS as reel_error:
+        if not _allow_route_upstream_fallback(reel_error):
+            raise
+        if not slugged_video_path:
+            try:
+                generic_post = _invoke_parser(
+                    JsonParser.process_post, post_path, original_response
+                )
+                if generic_post.video_links:
+                    return generic_post
+            except ROUTE_FALLBACK_EXCEPTIONS as error:
+                generic_error = error
+                if not _allow_route_upstream_fallback(error):
+                    raise
         try:
             return _invoke_parser(
                 VideoWatchParser.process_post, post_path, original_response
@@ -3224,14 +3926,21 @@ def _normalize_account_name(value: str) -> str | None:
             normalized = normalized[:-len(suffix)].strip()
     if not normalized:
         return None
-    lowered = normalized.lower()
-    if any(
-        marker in lowered
-        for marker in (
-            'facebook', 'log in', 'login', 'sign up', 'checkpoint',
-            'unsupported browser', 'privacy', 'error', 'not found',
-        )
-    ):
+    lowered = normalized.casefold()
+    if lowered in {
+        'facebook',
+        'log in',
+        'login',
+        'log in to facebook',
+        'facebook - log in or sign up',
+        'facebook | log in or sign up',
+        'sign up',
+        'checkpoint',
+        'unsupported browser',
+        'privacy',
+        'error',
+        'not found',
+    }:
         return None
     return normalized
 
@@ -3285,20 +3994,39 @@ def _cookie_probe_blocked_reason(
     body: str,
     html_parser: BeautifulSoup,
 ) -> str | None:
-    lowered_url = final_url.lower()
-    if '/login' in lowered_url:
+    if Utils.is_control_path(final_url, 'login'):
         return 'login redirect'
-    if '/checkpoint' in lowered_url:
+    if Utils.is_control_path(final_url, 'checkpoint'):
         return 'checkpoint redirect'
-    if '/recover' in lowered_url:
+    if Utils.is_control_path(final_url, 'recover'):
         return 'account recovery redirect'
-    if 'login_data' in body or 'useCometLogInFormQuery' in body:
-        return 'login wall'
-    title = html_parser.select_one('title')
-    if title:
-        lowered_title = title.get_text().lower()
-        if 'log in' in lowered_title or 'checkpoint' in lowered_title:
-            return 'login title'
+    route_names = {
+        str(route.get('canonicalRouteName', ''))
+        for route in JsonParser.get_initial_routes(
+            JsonParser.get_json_blocks(html_parser)
+        )
+    }
+    if route_names.intersection({
+        'comet.fbweb.CometLoginRoute',
+        'comet.fbweb.CometLoginPageRoute',
+        'comet.fbweb.CometCheckpointRoute',
+        'comet.fbweb.CometRecoveryRoute',
+    }):
+        return 'authentication route'
+    for form in html_parser.find_all('form'):
+        if not Utils.is_control_path(str(form.get('action', '')), 'login'):
+            continue
+        inputs = form.find_all('input')
+        input_names = {
+            str(node.get('name', '')).casefold() for node in inputs
+        }
+        input_types = {
+            str(node.get('type', '')).casefold() for node in inputs
+        }
+        if 'password' in input_types and input_names.intersection({
+            'email', 'pass', 'password'
+        }):
+            return 'login form'
     return None
 
 
@@ -3452,10 +4180,10 @@ def _run_tracked_cookie_attempts(
 
 
 def _record_scrape_error(error: Exception) -> None:
+    if isinstance(error, UnsupportedRouteException):
+        return
     parser_entered = bool(getattr(error, 'parser_pipeline_entered', False))
     if not parser_entered:
-        if isinstance(error, UnsupportedRouteException):
-            return
         if isinstance(error, ShareResolutionException):
             if not error.account_backed and error.count_as_error:
                 service_metrics.record_error()
@@ -3473,8 +4201,8 @@ def _record_cookie_failure(
 ) -> int:
     upstream_response = getattr(error, 'upstream_response', None)
     status = getattr(upstream_response, 'status_code', None)
-    final_url = str(getattr(upstream_response, 'url', '')).lower()
-    if status in (429, 503):
+    final_url = str(getattr(upstream_response, 'url', ''))
+    if status == 429:
         raw_retry_after = getattr(upstream_response, 'headers', {}).get('Retry-After')
         try:
             retry_after = int(str(raw_retry_after).strip())
@@ -3484,8 +4212,12 @@ def _record_cookie_failure(
             retry_after = None
         jar.mark_rate_limited(account_index, retry_after)
         return 0
-    if '/checkpoint' in final_url or '/recover' in final_url:
+    if Utils.is_control_path(final_url, 'checkpoint', 'recover'):
         count = jar.mark_checkpointed(account_index)
+    elif getattr(error, 'reason_code', '') != 'login_wall':
+        if affinity_key and jar.affinity_for(affinity_key) == account_index:
+            jar.forget_affinity(affinity_key)
+        return 0
     else:
         count = jar.mark_failed(account_index)
     if affinity_key and jar.affinity_for(affinity_key) == account_index:
@@ -3511,7 +4243,12 @@ def _maybe_notify_bad_account(
 
 
 def _is_cookie_retryable(error: Exception) -> bool:
-    if isinstance(error, (NoDataException, ParseException)):
+    if isinstance(error, NoDataException):
+        return error.reason_code not in {
+            'target_video_payload_missing', 'target_not_found',
+            'target_identity_mismatch',
+        }
+    if isinstance(error, ParseException):
         return True
     if not isinstance(error, UpstreamException):
         return False
@@ -3519,11 +4256,10 @@ def _is_cookie_retryable(error: Exception) -> bool:
     if upstream_response is None:
         return True
     status = getattr(upstream_response, 'status_code', None)
-    final_url = str(getattr(upstream_response, 'url', '')).lower()
+    final_url = str(getattr(upstream_response, 'url', ''))
     return (
         status in CFFI.retry_statuses
-        or '/checkpoint' in final_url
-        or '/recover' in final_url
+        or Utils.is_control_path(final_url, 'checkpoint', 'recover')
     )
 
 
@@ -3555,13 +4291,14 @@ def _run_cookie_attempts(
             try:
                 result = _handle_facebook_path(path)
             except (NoDataException, ParseException, UpstreamException) as exc:
-                if isinstance(exc, UnsupportedRouteException):
-                    raise
                 selected_response = cffi.selected_get_response or cffi.last_get_response
                 _attach_attempt_response(exc, selected_response)
                 if isinstance(exc, ShareResolutionException):
                     exc.account_backed = True
-                    if position + 1 < len(order):
+                    if (
+                        _is_cookie_retryable(exc)
+                        and position + 1 < len(order)
+                    ):
                         continue
                     raise
                 failure_affinity_key = _cookie_scope_key(cffi.affinity_path or path)
@@ -3609,7 +4346,8 @@ def _run_share_cookie_attempts(
     resolver_account_index = None
     last_resolution_error = None
 
-    for account_index in jar.account_order(None):
+    resolution_order = jar.account_order(None)
+    for resolution_position, account_index in enumerate(resolution_order):
         account = jar.account_at(account_index)
         with cffi.request_scope(account):
             try:
@@ -3623,7 +4361,29 @@ def _run_share_cookie_attempts(
                 _attach_attempt_response(exc, selected_response)
                 exc.account_backed = True
                 last_resolution_error = exc
-                continue
+                failure_count = _record_cookie_failure(
+                    jar, account_index, exc, None
+                )
+                _maybe_notify_bad_account(
+                    jar, account_index, failure_count, exc
+                )
+                if _is_cookie_retryable(exc):
+                    continue
+                raise
+            except UpstreamException as exc:
+                selected_response = (
+                    cffi.selected_get_response or cffi.last_get_response
+                )
+                _attach_attempt_response(exc, selected_response)
+                failure_count = _record_cookie_failure(
+                    jar, account_index, exc, None
+                )
+                _maybe_notify_bad_account(
+                    jar, account_index, failure_count, exc
+                )
+                if resolution_position + 1 < len(resolution_order):
+                    continue
+                raise
             except Exception as exc:
                 _attach_attempt_response(
                     exc, cffi.selected_get_response or cffi.last_get_response
@@ -3662,8 +4422,6 @@ def _run_share_cookie_attempts(
                     share_source_path=source_path,
                 )
             except (NoDataException, ParseException, UpstreamException) as exc:
-                if isinstance(exc, UnsupportedRouteException):
-                    raise
                 selected_response = (
                     cffi.selected_get_response
                     or cffi.last_get_response
@@ -3811,59 +4569,19 @@ def index(path: str):
         )
         if not parser_entered:
             service_metrics.record_request()
-    except UpstreamException as exc:
-        _record_scrape_error(exc)
-        selected_response = getattr(exc, 'selected_response', None)
-        status = exc.status_code
-        if status in (403, 404):
-            response.status = 404
-        elif status in CFFI.retry_statuses or status is None or (status and status >= 500):
-            response.status = 503
-            response.headers['Retry-After'] = str(exc.retry_after or 60)
-        else:
-            response.status = 502
-        response.headers['Cache-Control'] = 'no-store'
-        logging.warning('upstream failure on /%s: %s', original_path, exc)
-        result = format_error_message_embed(f'{WWWFB}/{original_path}')
-    except NoDataException as exc:
-        _record_scrape_error(exc)
-        selected_response = getattr(exc, 'selected_response', None)
-        response.status = 404
-        response.headers['Cache-Control'] = 'no-store'
-        logging.info('no data for /%s (login wall / restricted)', original_path)
-        result = format_error_message_embed(f'{WWWFB}/{original_path}')
-    except ParseException as exc:
-        _record_scrape_error(exc)
-        selected_response = getattr(exc, 'selected_response', None)
-        response.status = 502
-        response.headers['Cache-Control'] = 'no-store'
-        logging.error('parser bug on /%s\n%s', original_path, traceback.format_exc())
-        page_url = exc.url or f'{WWWFB}/{original_path}'
-        filename = re.sub(r'[^a-zA-Z0-9]', '_', original_path)[:80] + '.html' if exc.html else None
-        display_path = '/' + original_path.lstrip('/')
-        desc = f'🔗 [`{display_path}`]({page_url})\n🚩 {exc}'
-        if filename:
-            desc += ' and attached file'
-        embed = DiscordEmbed(title='embed failure', description=desc, color='FF0000')
-        if filename:
-            embed.add_embed_field(name='Attached Payload', value=f'`{filename}`', inline=True)
-        if exc.html:
-            Utils.warn(file_content=exc.html.encode('utf-8'), filename=filename, embed=embed)
-        else:
-            Utils.warn(embed=embed)
-        result = format_error_message_embed(f'{WWWFB}/{original_path}')
-    except FacebedException as exc:
-        _record_scrape_error(exc)
-        selected_response = getattr(exc, 'selected_response', None)
-        response.status = 502
-        response.headers['Cache-Control'] = 'no-store'
-        logging.warning('Facebed failure on /%s\n%s', original_path, traceback.format_exc())
-        result = format_error_message_embed(f'{WWWFB}/{original_path}')
     except Exception as exc:
         _record_scrape_error(exc)
-        response.status = 502
-        response.headers['Cache-Control'] = 'no-store'
-        logging.error('something broke on /%s\n%s', original_path, traceback.format_exc())
+        selected_response = getattr(exc, 'selected_response', None)
+        if selected_response is None:
+            selected_response = getattr(exc, 'upstream_response', None)
+        reason = getattr(exc, 'reason_code', 'internal_error')
+        logging.warning(
+            'embed fallback type=%s reason=%s url=%s detail=%s',
+            failed_post_type(original_path, selected_response, reason),
+            reason,
+            f'{WWWFB}/{original_path}',
+            ' '.join(str(exc).split()),
+        )
         result = format_error_message_embed(f'{WWWFB}/{original_path}')
 
     if dump_requested:
@@ -3894,16 +4612,7 @@ def log_to_logger(fn):
     @wraps(fn)
     def _log_to_logger(*argsz, **kwargs):
         actual_response = fn(*argsz, **kwargs)
-        title = 'unknown'
-        if isinstance(actual_response, str):
-            error_match = re.search(r'content="Log in or sign up to view \[(.*)\]"', actual_response)
-            if error_match:
-                title = f'Error: {error_match.group(1)}'
-            else:
-                title_match = re.search(r'content="([^"]*)"', actual_response)
-                if title_match:
-                    title = title_match.group(1)
-        logging.info('%s %s %s %s %s' % (request.remote_addr, request.method, request.url, response.status, title))
+        logging.info('%s %s %s %s', request.remote_addr, request.method, request.url, response.status)
         return actual_response
 
     return _log_to_logger
