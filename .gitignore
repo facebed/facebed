@@ -163,9 +163,6 @@ debug.*
 # macOS bullshit
 .DS_Store
 
-cookies.txt
-cookies*.json
-useragents.json
 .tokensave/
 samples
 jk

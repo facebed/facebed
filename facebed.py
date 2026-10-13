@@ -3,11 +3,8 @@ import base64
 import io
 import json
 import logging
-import math
 import os
-import queue
 import re
-import signal
 import sys
 import threading
 import time
@@ -16,11 +13,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
 from functools import wraps
-from html import escape, unescape
+from html import escape
 from pathlib import Path
 from typing import Self, Callable
 from urllib.parse import quote as _quote_
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import crawleruseragents
 from curl_cffi.requests import Session as CffiSession
@@ -78,7 +75,6 @@ class ShareResolutionException(NoDataException):
         )
         self.upstream_response = response
         self.count_as_error = count_as_error
-        self.account_backed = False
 
 
 class ParseException(FacebedException):
@@ -128,7 +124,7 @@ class CFFI:
         self._local = threading.local()
 
     @contextmanager
-    def request_scope(self, account=None):
+    def request_scope(self):
         if getattr(self._local, 'session', None) is not None:
             yield self._local.session
             return
@@ -147,7 +143,6 @@ class CFFI:
             discard_cookies=True,
         )
         self._local.session = session
-        self._local.account = account
         self._local.get_cache = {}
         self._local.responses = []
         self._local.last_get_response = None
@@ -159,8 +154,8 @@ class CFFI:
                 session.close()
             finally:
                 for attr in (
-                    'session', 'account', 'get_cache', 'responses', 'last_get_response',
-                    'selected_get_response', 'affinity_path',
+                    'session', 'get_cache', 'responses', 'last_get_response',
+                    'selected_get_response',
                 ):
                     if hasattr(self._local, attr):
                         delattr(self._local, attr)
@@ -175,17 +170,6 @@ class CFFI:
     @property
     def selected_get_response(self) -> CffiResponse | None:
         return getattr(self._local, 'selected_get_response', None)
-
-    @property
-    def current_account(self):
-        return getattr(self._local, 'account', None)
-
-    @property
-    def affinity_path(self) -> str | None:
-        return getattr(self._local, 'affinity_path', None)
-
-    def set_affinity_path(self, path: str) -> None:
-        self._local.affinity_path = path
 
     def select_response(self, response: CffiResponse | None) -> None:
         if response is not None:
@@ -207,13 +191,17 @@ class CFFI:
         check_status = kwargs.pop('_check_status', True)
         retry_status_responses = kwargs.pop('_retry_status_responses', True)
         bypass_cache = kwargs.pop('_bypass_cache', False)
-        use_cookies = kwargs.pop('_use_cookies', True)
+        follow_redirects = kwargs.pop('allow_redirects', True)
+        max_redirects = kwargs.pop('max_redirects', 10)
         kwargs.pop('cookies', None)
-        headers = dict(kwargs.pop('headers', {}))
-        headers = self._request_headers(url, headers, use_cookies)
-        kwargs.setdefault('allow_redirects', True)
+        headers = {
+            key: value
+            for key, value in dict(kwargs.pop('headers', {})).items()
+            if str(key).lower() != 'cookie'
+        }
         kwargs.setdefault('timeout', self.timeout)
-        kwargs.setdefault('max_redirects', 10)
+        if not isinstance(max_redirects, int):
+            raise TypeError('max_redirects must be an integer')
         cache = getattr(self._local, 'get_cache', {})
         def freeze(value):
             if isinstance(value, dict):
@@ -232,6 +220,8 @@ class CFFI:
             url,
             freeze({
                 'headers': headers,
+                'allow_redirects': follow_redirects,
+                'max_redirects': max_redirects,
                 **{key: value for key, value in kwargs.items() if key != 'timeout'},
             }),
         )
@@ -248,27 +238,98 @@ class CFFI:
         last_response: CffiResponse | None = None
         for attempt in range(1, self.max_attempts + 1):
             try:
-                request_kwargs = dict(kwargs)
-                if headers:
-                    request_kwargs['headers'] = headers
-                upstream_response = sess.request(method, url, **request_kwargs)
-                last_response = upstream_response
-                content_bytes = len(upstream_response.content or b'') if method == 'GET' else 0
-                final_url = str(upstream_response.url)
-                status_code = int(upstream_response.status_code)
-                history = getattr(upstream_response, 'history', []) or []
-                logging.info(
-                    'upstream %s %s -> %s status=%s redirects=%s bytes=%s attempt=%s',
-                    method, url, final_url, status_code, len(history), content_bytes, attempt,
-                )
-                self._local.responses.append({
-                    'method': method,
-                    'requested_url': url,
-                    'final_url': final_url,
-                    'status': status_code,
-                    'bytes': content_bytes,
-                    'attempt': attempt,
-                })
+                current_method = method
+                current_url = url
+                history: list[CffiResponse] = []
+                visited_urls = {url}
+                while True:
+                    request_kwargs = dict(kwargs)
+                    if history:
+                        request_kwargs.pop('params', None)
+                    request_headers = dict(headers)
+                    if request_headers:
+                        request_kwargs['headers'] = request_headers
+                    request_kwargs['allow_redirects'] = False
+                    request_kwargs['max_redirects'] = 0
+
+                    sess.cookies.clear()
+                    try:
+                        upstream_response = sess.request(
+                            current_method,
+                            current_url,
+                            **request_kwargs,
+                        )
+                    finally:
+                        sess.cookies.clear()
+
+                    last_response = upstream_response
+                    upstream_response.cookies.clear()
+                    content_bytes = (
+                        len(upstream_response.content or b'')
+                        if current_method == 'GET' else 0
+                    )
+                    final_url = str(upstream_response.url)
+                    status_code = int(upstream_response.status_code)
+                    location = upstream_response.headers.get('Location')
+                    logging.info(
+                        'upstream %s %s -> %s status=%s redirect_hop=%s bytes=%s attempt=%s',
+                        current_method,
+                        current_url,
+                        final_url,
+                        status_code,
+                        len(history),
+                        content_bytes,
+                        attempt,
+                    )
+                    self._local.responses.append({
+                        'method': current_method,
+                        'requested_url': current_url,
+                        'final_url': final_url,
+                        'status': status_code,
+                        'bytes': content_bytes,
+                        'attempt': attempt,
+                    })
+
+                    should_redirect = bool(
+                        follow_redirects
+                        and location
+                        and status_code in {301, 302, 303, 307, 308}
+                    )
+                    if not should_redirect:
+                        upstream_response.history = history
+                        upstream_response.redirect_count = len(history)
+                        break
+
+                    history.append(upstream_response)
+                    if max_redirects >= 0 and len(history) > max_redirects:
+                        raise UpstreamException(
+                            f'Facebook exceeded {max_redirects} redirects for {url}',
+                            upstream_response,
+                        )
+                    next_url = urljoin(final_url, location)
+                    parsed_next_url = urlparse(next_url)
+                    if (
+                        parsed_next_url.scheme.lower() not in {'http', 'https'}
+                        or not parsed_next_url.hostname
+                        or parsed_next_url.username is not None
+                        or parsed_next_url.password is not None
+                    ):
+                        raise UpstreamException(
+                            f'Facebook returned an unsafe redirect target for {url}',
+                            upstream_response,
+                        )
+                    if next_url in visited_urls:
+                        raise UpstreamException(
+                            f'Facebook entered a redirect loop for {url}',
+                            upstream_response,
+                        )
+                    visited_urls.add(next_url)
+                    current_url = next_url
+                    if status_code == 303 and current_method != 'HEAD':
+                        current_method = 'GET'
+                        for key in ('data', 'json', 'files', 'multipart'):
+                            kwargs.pop(key, None)
+
                 if method == 'GET':
                     cache[cache_key] = upstream_response
                     self._local.last_get_response = upstream_response
@@ -301,36 +362,6 @@ class CFFI:
             last_response,
             transport_error=True,
         ) from last_error
-
-    def _request_headers(
-        self,
-        url: str,
-        headers: dict,
-        use_cookies: bool,
-    ) -> dict:
-        account = getattr(self._local, 'account', None)
-        hostname = (urlparse(url).hostname or '').lower()
-        is_facebook = hostname == 'facebook.com' or hostname.endswith('.facebook.com')
-        result = {
-            key: value
-            for key, value in headers.items()
-            if str(key).lower() != 'cookie'
-        }
-        if account is None or not use_cookies or not is_facebook:
-            return result
-        result = {
-            key: value
-            for key, value in result.items()
-            if str(key).lower() != 'user-agent'
-        }
-        result['Cookie'] = account.header_value()
-        result['User-Agent'] = (
-            account.user_agent
-            if account.user_agent is not None
-            else DEFAULT_FACEBOOK_USER_AGENT
-        )
-        return result
-
 
 BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR / 'assets'
@@ -914,442 +945,6 @@ class Jq:
                 return False
         return True
 
-@dataclass(frozen=True)
-class CookieEntry:
-    name: str
-    value: str
-    expiration_date: float | None = None
-
-
-class CookieAccount:
-    def __init__(
-        self,
-        label: str,
-        entries: list[CookieEntry],
-        user_agent: str | None = None,
-    ) -> None:
-        self.label = label
-        self.entries = entries
-        self.user_agent = user_agent
-        self._cookie_header = '; '.join(f'{entry.name}={entry.value}' for entry in entries)
-
-    def header_value(self) -> str:
-        return self._cookie_header
-
-    def any_expired(self) -> bool:
-        now = time.time()
-        return any(
-            entry.expiration_date is not None and entry.expiration_date <= now
-            for entry in self.entries
-        )
-
-
-ACCOUNT_COOLDOWN_SECS = 300
-RATE_LIMIT_COOLDOWN_SECS = 60
-RATE_LIMIT_COOLDOWN_MAX_SECS = 600
-CHECKPOINT_COOLDOWN_SECS = 1800
-AFFINITY_CAP = 1024
-NOTIFY_FAILURE_THRESHOLD = 3
-
-
-class CookieJar:
-    def __init__(self, accounts: list[CookieAccount] | None = None) -> None:
-        self.accounts = list(accounts or [])
-        self._cooldown_until = [0.0] * len(self.accounts)
-        self._consecutive_failures = [0] * len(self.accounts)
-        self._affinity: dict[str, int] = {}
-        self._state_lock = threading.Lock()
-
-    @classmethod
-    def load(cls, path: Path | str) -> Self:
-        cookie_path = Path(path)
-        accounts: list[CookieAccount] = []
-        seen: set[Path] = set()
-
-        def load_one(candidate: Path) -> None:
-            canonical = candidate.resolve()
-            if canonical in seen:
-                return
-            seen.add(canonical)
-            try:
-                accounts.extend(cls._load_file(candidate))
-            except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
-                logging.warning('failed to load %s: %s', candidate, exc)
-
-        if cookie_path.exists():
-            load_one(cookie_path)
-        else:
-            logging.warning('%s not found', cookie_path)
-
-        parent = cookie_path.parent
-        try:
-            siblings = sorted(
-                candidate
-                for candidate in parent.iterdir()
-                if candidate.is_file()
-                and candidate.name.startswith('cookies')
-                and candidate.name.endswith('.json')
-                and candidate.name != 'cookies.example.json'
-            )
-        except OSError as exc:
-            logging.warning('could not scan %s for cookie files: %s', parent, exc)
-            siblings = []
-        for sibling in siblings:
-            load_one(sibling)
-
-        user_agents = cls._load_useragents(parent)
-        for account in accounts:
-            if account.user_agent is None and account.label in user_agents:
-                account.user_agent = user_agents[account.label]
-
-        cls._log_accounts(accounts)
-        if not accounts:
-            logging.warning('no cookies loaded, non incognito-viewable posts will NOT work')
-        return cls(accounts)
-
-    @classmethod
-    def load_strict(cls, path: Path | str) -> Self:
-        cookie_path = Path(path)
-        parent = cookie_path.parent
-        candidates = [cookie_path] if cookie_path.exists() else []
-        candidates.extend(
-            sorted(
-                candidate
-                for candidate in parent.iterdir()
-                if candidate.is_file()
-                and candidate.name.startswith('cookies')
-                and candidate.name.endswith('.json')
-                and candidate.name != 'cookies.example.json'
-            )
-        )
-        accounts: list[CookieAccount] = []
-        seen: set[Path] = set()
-        for candidate in candidates:
-            canonical = candidate.resolve()
-            if canonical in seen:
-                continue
-            seen.add(canonical)
-            accounts.extend(cls._load_file(candidate))
-        user_agents = cls._load_useragents(parent)
-        for account in accounts:
-            if account.user_agent is None and account.label in user_agents:
-                account.user_agent = user_agents[account.label]
-        cls._log_accounts(accounts)
-        return cls(accounts)
-
-    @staticmethod
-    def _log_accounts(accounts: list[CookieAccount]) -> None:
-        for account in accounts:
-            logging.info(
-                "loaded %s cookies for account '%s'",
-                len(account.entries),
-                account.label,
-            )
-            if account.any_expired():
-                logging.info(
-                    "account '%s' has stale cookie expiration timestamps; live account check decides usability",
-                    account.label,
-                )
-
-    @classmethod
-    def _load_file(cls, cookie_path: Path) -> list[CookieAccount]:
-        def reject_constant(value: str):
-            raise ValueError(f'non-finite JSON number: {value}')
-
-        def parse_float(value: str) -> float:
-            parsed = float(value)
-            if not math.isfinite(parsed):
-                raise ValueError(f'non-finite JSON number: {value}')
-            return parsed
-
-        loaded = json.loads(
-            cookie_path.read_text(encoding='utf-8'),
-            parse_constant=reject_constant,
-            parse_float=parse_float,
-        )
-        if isinstance(loaded, list):
-            entries = cls._parse_entries(loaded)
-            if not entries:
-                return []
-            stem = cookie_path.stem
-            label = stem.removeprefix('cookies').lstrip('-_') or 'default'
-            return [CookieAccount(label, entries)]
-        if isinstance(loaded, dict):
-            raw_accounts = loaded.get('accounts')
-            if not isinstance(raw_accounts, list):
-                raise ValueError('accounts must be a list')
-            accounts = []
-            for raw_account in raw_accounts:
-                if not isinstance(raw_account, dict):
-                    raise ValueError('account must be an object')
-                label = raw_account.get('label')
-                if not isinstance(label, str):
-                    raise ValueError('account label must be a string')
-                user_agent = raw_account.get('user_agent', raw_account.get('userAgent'))
-                if user_agent is not None and not isinstance(user_agent, str):
-                    raise ValueError('account user agent must be a string')
-                accounts.append(
-                    CookieAccount(
-                        label,
-                        cls._parse_entries(raw_account.get('entries')),
-                        user_agent,
-                    )
-                )
-            return accounts
-        raise ValueError('unsupported cookies file shape')
-
-    @staticmethod
-    def _parse_entries(raw_entries: list) -> list[CookieEntry]:
-        if not isinstance(raw_entries, list):
-            raise ValueError('cookie entries must be a list')
-        entries = []
-        for entry in raw_entries:
-            if not isinstance(entry, dict):
-                raise ValueError('cookie entry must be an object')
-            name = entry.get('name')
-            value = entry.get('value')
-            expiration = entry.get('expirationDate')
-            if not isinstance(name, str) or not isinstance(value, str):
-                raise ValueError('cookie name and value must be strings')
-            if expiration is not None and (
-                isinstance(expiration, bool) or not isinstance(expiration, (int, float))
-            ):
-                raise ValueError('cookie expirationDate must be numeric')
-            if expiration is not None:
-                try:
-                    expiration_is_finite = math.isfinite(expiration)
-                except OverflowError:
-                    expiration_is_finite = False
-                if not expiration_is_finite:
-                    raise ValueError('cookie expirationDate must be finite')
-            entries.append(CookieEntry(name, value, expiration))
-        return entries
-
-    @staticmethod
-    def _load_useragents(parent: Path) -> dict[str, str]:
-        sidecar = parent / 'useragents.json'
-        if not sidecar.exists():
-            return {}
-        try:
-            loaded = json.loads(sidecar.read_text(encoding='utf-8'))
-            if not isinstance(loaded, dict) or not all(
-                isinstance(label, str) and isinstance(user_agent, str)
-                for label, user_agent in loaded.items()
-            ):
-                raise ValueError('useragents.json must map labels to strings')
-            return loaded
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            logging.warning('failed to parse %s: %s', sidecar, exc)
-            return {}
-
-    def len(self) -> int:
-        return len(self.accounts)
-
-    def is_empty(self) -> bool:
-        return not self.accounts
-
-    def account_at(self, index: int) -> CookieAccount | None:
-        if not self.accounts:
-            return None
-        return self.accounts[index % len(self.accounts)]
-
-    def _set_cooldown(self, index: int, seconds: int) -> None:
-        if not self.accounts:
-            return
-        normalized = index % len(self.accounts)
-        self._cooldown_until[normalized] = time.time() + seconds
-
-    def mark_failed(self, index: int) -> int:
-        if not self.accounts:
-            return 0
-        normalized = index % len(self.accounts)
-        with self._state_lock:
-            self._set_cooldown(normalized, ACCOUNT_COOLDOWN_SECS)
-            self._consecutive_failures[normalized] += 1
-            return self._consecutive_failures[normalized]
-
-    def mark_rate_limited(self, index: int, retry_after: int | None) -> None:
-        if not self.accounts:
-            return
-        seconds = (
-            min(retry_after, RATE_LIMIT_COOLDOWN_MAX_SECS)
-            if retry_after is not None and retry_after >= 0
-            else RATE_LIMIT_COOLDOWN_SECS
-        )
-        with self._state_lock:
-            self._set_cooldown(index, seconds)
-
-    def mark_checkpointed(self, index: int) -> int:
-        if not self.accounts:
-            return 0
-        normalized = index % len(self.accounts)
-        with self._state_lock:
-            self._set_cooldown(normalized, CHECKPOINT_COOLDOWN_SECS)
-            self._consecutive_failures[normalized] += 1
-            return self._consecutive_failures[normalized]
-
-    def mark_ok(self, index: int) -> None:
-        if not self.accounts:
-            return
-        normalized = index % len(self.accounts)
-        with self._state_lock:
-            self._cooldown_until[normalized] = 0
-            self._consecutive_failures[normalized] = 0
-
-    def reset_failure_count(self, index: int) -> None:
-        if not self.accounts:
-            return
-        with self._state_lock:
-            self._consecutive_failures[index % len(self.accounts)] = 0
-
-    def in_cooldown(self, index: int) -> bool:
-        if not self.accounts:
-            return False
-        normalized = index % len(self.accounts)
-        return time.time() < self._cooldown_until[normalized]
-
-    def affinity_for(self, key: str) -> int | None:
-        with self._state_lock:
-            return self._affinity.get(key)
-
-    def set_affinity(self, key: str, account_index: int) -> None:
-        if not self.accounts:
-            return
-        with self._state_lock:
-            if len(self._affinity) >= AFFINITY_CAP and key not in self._affinity:
-                self._affinity.pop(next(iter(self._affinity)))
-            self._affinity[key] = account_index % len(self.accounts)
-
-    def forget_affinity(self, key: str) -> None:
-        with self._state_lock:
-            self._affinity.pop(key, None)
-
-    def account_order(self, affinity_key: str | None = None) -> list[int]:
-        now = time.time()
-        with self._state_lock:
-            healthy = [
-                index
-                for index, cooldown_until in enumerate(self._cooldown_until)
-                if now >= cooldown_until
-            ]
-            cooled = [
-                index
-                for index, cooldown_until in enumerate(self._cooldown_until)
-                if now < cooldown_until
-            ]
-            preferred = self._affinity.get(affinity_key) if affinity_key else None
-            if preferred in healthy:
-                healthy.remove(preferred)
-                healthy.insert(0, preferred)
-            return [*healthy, *cooled]
-
-
-class CookieStore:
-    def __init__(self, jar: CookieJar | None = None) -> None:
-        self._jar = jar or CookieJar()
-        self._lock = threading.Lock()
-
-    def snapshot(self) -> CookieJar:
-        with self._lock:
-            return self._jar
-
-    def replace(self, jar: CookieJar) -> None:
-        with self._lock:
-            self._jar = jar
-
-
-cookie_store = CookieStore()
-
-
-def reload_cookie_store(
-    cookie_path: Path | str,
-    store: CookieStore = cookie_store,
-) -> bool:
-    try:
-        new_jar = CookieJar.load_strict(cookie_path)
-    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
-        logging.warning('cookie reload failed: %s', exc)
-        return False
-    store.replace(new_jar)
-    logging.info('reloaded %s cookie account(s)', new_jar.len())
-    return True
-
-
-class CookieReloadController:
-    _STOP = object()
-
-    def __init__(self, cookie_path: Path | str, store: CookieStore) -> None:
-        self.cookie_path = cookie_path
-        self.store = store
-        self._requests = queue.SimpleQueue()
-        self._thread = threading.Thread(
-            target=self._run,
-            name='facebed-cookie-reload',
-            daemon=True,
-        )
-
-    def start(self) -> None:
-        self._thread.start()
-
-    def request_reload(self) -> None:
-        self._requests.put(None)
-
-    def stop(self) -> None:
-        self._requests.put(self._STOP)
-
-    def _run(self) -> None:
-        while True:
-            request = self._requests.get()
-            if request is self._STOP:
-                return
-            reload_cookie_store(self.cookie_path, self.store)
-
-
-_cookie_reload_controller_lock = threading.Lock()
-_cookie_reload_controller: CookieReloadController | None = None
-
-
-def install_cookie_reload_handler(
-    cookie_path: Path | str,
-    store: CookieStore = cookie_store,
-) -> bool:
-    global _cookie_reload_controller
-
-    if not hasattr(signal, 'SIGHUP'):
-        return False
-
-    controller = CookieReloadController(cookie_path, store)
-
-    def reload_handler(_signum, _frame) -> None:
-        controller.request_reload()
-
-    signal.signal(signal.SIGHUP, reload_handler)
-    controller.start()
-    with _cookie_reload_controller_lock:
-        previous = _cookie_reload_controller
-        _cookie_reload_controller = controller
-    if previous is not None:
-        previous.stop()
-    return True
-
-
-@dataclass(frozen=True)
-class CookieAccountCheck:
-    index: int
-    label: str
-    ok: bool
-    account_name: str | None
-    status: int | None
-    reason: str | None
-
-
-class NoCookies:
-    @staticmethod
-    def get_cookies() -> dict[str, str]:
-        return {}
-
-
-acc = NoCookies()
 
 
 class Story:
@@ -2222,7 +1817,7 @@ class JsonParser:
 
         declared_urls = [*canonical_urls, *og_urls]
         auth_wall = bool(
-            _cookie_probe_blocked_reason(response_url, '', html_parser)
+            _authentication_wall_reason(response_url, html_parser)
             or (
                 declared_urls
                 and all(
@@ -2348,7 +1943,6 @@ class JsonParser:
     @contextmanager
     def fetch_page(
         post_path: str,
-        use_cookies: bool = True,
         http_response: CffiResponse | None = None,
     ):
         url = JsonParser.ensure_full_url(post_path)
@@ -3392,9 +2986,9 @@ class ReelsParser:
         http_response: CffiResponse | None = None,
     ) -> ParsedPost:
         if http_response is None:
-            page = JsonParser.fetch_page(post_path, use_cookies=True)
+            page = JsonParser.fetch_page(post_path)
         else:
-            page = JsonParser.fetch_page(post_path, use_cookies=True, http_response=http_response)
+            page = JsonParser.fetch_page(post_path, http_response=http_response)
         with page as html_parser:
             requested_ids, _strong_ids = JsonParser.get_target_ids(html_parser, post_path)
             content_node = ReelsParser.get_content_node(html_parser, requested_ids)
@@ -3518,9 +3112,9 @@ class VideoWatchParser:
         http_response: CffiResponse | None = None,
     ) -> ParsedPost:
         if http_response is None:
-            page = JsonParser.fetch_page(post_path, use_cookies=True)
+            page = JsonParser.fetch_page(post_path)
         else:
-            page = JsonParser.fetch_page(post_path, use_cookies=True, http_response=http_response)
+            page = JsonParser.fetch_page(post_path, http_response=http_response)
         with page as html_parser:
             requested_ids, _strong_ids = JsonParser.get_target_ids(html_parser, post_path)
             content_node = VideoWatchParser.get_content_node(html_parser, requested_ids)
@@ -3919,79 +3513,8 @@ def _send_dump_report(
         logging.error("couldn't dump /%s\n%s", path, traceback.format_exc())
 
 
-def _normalize_account_name(value: str) -> str | None:
-    normalized = ' '.join(unescape(value).split()).strip()
-    for suffix in (' | Facebook', ' - Facebook'):
-        if normalized.endswith(suffix):
-            normalized = normalized[:-len(suffix)].strip()
-    if not normalized:
-        return None
-    lowered = normalized.casefold()
-    if lowered in {
-        'facebook',
-        'log in',
-        'login',
-        'log in to facebook',
-        'facebook - log in or sign up',
-        'facebook | log in or sign up',
-        'sign up',
-        'checkpoint',
-        'unsupported browser',
-        'privacy',
-        'error',
-        'not found',
-    }:
-        return None
-    return normalized
-
-
-def _extract_cookie_account_name(
-    html_parser: BeautifulSoup,
-    body: str = '',
-) -> str | None:
-    og_title = html_parser.select_one('meta[property="og:title"]')
-    if og_title and og_title.get('content'):
-        account_name = _normalize_account_name(str(og_title['content']))
-        if account_name:
-            return account_name
-    title = html_parser.select_one('title')
-    if title:
-        account_name = _normalize_account_name(title.get_text())
-        if account_name:
-            return account_name
-    for block in JsonParser.get_json_blocks(html_parser):
-        for candidate in Jq.enumerate(block):
-            if not isinstance(candidate, dict) or not (
-                'ACCOUNT_ID' in candidate or 'USER_ID' in candidate
-            ):
-                continue
-            for key in ('NAME', 'SHORT_NAME', 'name'):
-                value = candidate.get(key)
-                if isinstance(value, str):
-                    account_name = _normalize_account_name(value)
-                    if account_name:
-                        return account_name
-    marker = 'CurrentUserInitialData'
-    offset = 0
-    while (start := body.find(marker, offset)) >= 0:
-        window = body[start:start + 6000]
-        match = re.search(r'"NAME"\s*:\s*"((?:\\.|[^"\\])*)"', window)
-        if match:
-            try:
-                decoded = json.loads(f'"{match.group(1)}"')
-            except json.JSONDecodeError:
-                decoded = None
-            if isinstance(decoded, str):
-                account_name = _normalize_account_name(decoded)
-                if account_name:
-                    return account_name
-        offset = start + len(marker)
-    return None
-
-
-def _cookie_probe_blocked_reason(
+def _authentication_wall_reason(
     final_url: str,
-    body: str,
     html_parser: BeautifulSoup,
 ) -> str | None:
     if Utils.is_control_path(final_url, 'login'):
@@ -4029,119 +3552,6 @@ def _cookie_probe_blocked_reason(
             return 'login form'
     return None
 
-
-def check_cookie_account(jar: CookieJar, account_index: int) -> CookieAccountCheck:
-    account = jar.account_at(account_index)
-    if account is None:
-        return CookieAccountCheck(
-            account_index, f'#{account_index}', False, None, None, 'account missing'
-        )
-    try:
-        with cffi.request_scope(account):
-            http_response = cffi.get(
-                f'{WWWFB}/me',
-                _check_status=False,
-                _retry_status_responses=False,
-                _bypass_cache=True,
-            )
-    except UpstreamException as exc:
-        return CookieAccountCheck(
-            account_index,
-            account.label,
-            False,
-            None,
-            exc.status_code,
-            f'http: {exc}',
-        )
-
-    status = int(http_response.status_code)
-    try:
-        body = http_response.text
-    except Exception as exc:
-        return CookieAccountCheck(
-            account_index,
-            account.label,
-            False,
-            None,
-            status,
-            f'read body: {exc}',
-        )
-    if status < 200 or status >= 300:
-        return CookieAccountCheck(
-            account_index, account.label, False, None, status, f'status {status}'
-        )
-    html_parser = BeautifulSoup(body, 'html.parser')
-    blocked_reason = _cookie_probe_blocked_reason(
-        str(http_response.url), body, html_parser
-    )
-    if blocked_reason:
-        return CookieAccountCheck(
-            account_index, account.label, False, None, status, blocked_reason
-        )
-    account_name = _extract_cookie_account_name(html_parser, body)
-    return CookieAccountCheck(
-        account_index,
-        account.label,
-        account_name is not None,
-        account_name,
-        status,
-        None if account_name is not None else 'account name not found',
-    )
-
-
-def check_cookie_accounts(jar: CookieJar) -> list[CookieAccountCheck]:
-    return [check_cookie_account(jar, index) for index in range(jar.len())]
-
-
-def start_cookie_health_check(jar: CookieJar) -> threading.Thread | None:
-    if jar.is_empty():
-        return None
-
-    def worker() -> None:
-        bad_accounts = []
-        for check in check_cookie_accounts(jar):
-            if check.ok:
-                logging.info(
-                    "cookie account alive index=%s account='%s' name='%s' status=%s",
-                    check.index, check.label, check.account_name or '?', check.status,
-                )
-            else:
-                reason = check.reason or 'unknown'
-                logging.warning(
-                    "cookie account bad index=%s account='%s' status=%s reason=%s",
-                    check.index, check.label, check.status, reason,
-                )
-                bad_accounts.append(f'{check.label} ({reason})')
-        if bad_accounts:
-            Utils.warn(
-                '@everyone cookie account check failed: ' + ', '.join(bad_accounts)
-            )
-
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
-    return thread
-
-
-def _cookie_scope_key(path: str) -> str | None:
-    parsed_path = urlparse(JsonParser.ensure_full_url(path)).path.strip('/')
-    if parsed_path.startswith('reel/'):
-        return 'kind/reels'
-    if parsed_path.startswith('watch'):
-        return 'kind/watch'
-    if parsed_path.startswith('groups/'):
-        parts = parsed_path.split('/')
-        if len(parts) > 1 and parts[1]:
-            return f'groups/{parts[1]}'
-    parts = parsed_path.split('/')
-    if (
-        len(parts) > 1
-        and parts[0]
-        and parts[1] in {'posts', 'videos', 'photos', 'timeline', 'reels', 'media'}
-    ):
-        return f'user/{parts[0]}'
-    return None
-
-
 _parser_pipeline_local = threading.local()
 
 
@@ -4166,13 +3576,12 @@ def _mark_parser_pipeline_entry() -> None:
         service_metrics.record_request()
 
 
-def _run_tracked_cookie_attempts(
+def _run_tracked_request(
     path: str,
-    jar: CookieJar,
 ) -> tuple[str, CffiResponse | None, bool]:
     with _parser_pipeline_scope() as state:
         try:
-            result, selected_response = _run_cookie_attempts(path, jar)
+            result, selected_response = _run_request(path)
         except Exception as exc:
             setattr(exc, 'parser_pipeline_entered', state['entered'])
             raise
@@ -4183,145 +3592,13 @@ def _record_scrape_error(error: Exception) -> None:
     if isinstance(error, UnsupportedRouteException):
         return
     parser_entered = bool(getattr(error, 'parser_pipeline_entered', False))
-    if not parser_entered:
-        if isinstance(error, ShareResolutionException):
-            if not error.account_backed and error.count_as_error:
-                service_metrics.record_error()
-            return
+    if not parser_entered and isinstance(error, ShareResolutionException):
+        if error.count_as_error:
+            service_metrics.record_error()
+        return
     if not parser_entered:
         service_metrics.record_request()
     service_metrics.record_error()
-
-
-def _record_cookie_failure(
-    jar: CookieJar,
-    account_index: int,
-    error: Exception,
-    affinity_key: str | None,
-) -> int:
-    upstream_response = getattr(error, 'upstream_response', None)
-    status = getattr(upstream_response, 'status_code', None)
-    final_url = str(getattr(upstream_response, 'url', ''))
-    if status == 429:
-        raw_retry_after = getattr(upstream_response, 'headers', {}).get('Retry-After')
-        try:
-            retry_after = int(str(raw_retry_after).strip())
-        except (TypeError, ValueError):
-            retry_after = None
-        if retry_after is not None and retry_after < 0:
-            retry_after = None
-        jar.mark_rate_limited(account_index, retry_after)
-        return 0
-    if Utils.is_control_path(final_url, 'checkpoint', 'recover'):
-        count = jar.mark_checkpointed(account_index)
-    elif getattr(error, 'reason_code', '') != 'login_wall':
-        if affinity_key and jar.affinity_for(affinity_key) == account_index:
-            jar.forget_affinity(affinity_key)
-        return 0
-    else:
-        count = jar.mark_failed(account_index)
-    if affinity_key and jar.affinity_for(affinity_key) == account_index:
-        jar.forget_affinity(affinity_key)
-    return count
-
-
-def _maybe_notify_bad_account(
-    jar: CookieJar,
-    account_index: int,
-    count: int,
-    error: Exception,
-) -> None:
-    if count != NOTIFY_FAILURE_THRESHOLD:
-        return
-    account = jar.account_at(account_index)
-    label = account.label if account is not None else '?'
-    Utils.warn(
-        f'@everyone account `{label}` failed {count}× in a row — cookie likely expired or checkpointed. '
-        f'Please re-export and update `cookies-{label}.json`. Last error: `{error}`'
-    )
-    jar.reset_failure_count(account_index)
-
-
-def _is_cookie_retryable(error: Exception) -> bool:
-    if isinstance(error, NoDataException):
-        return error.reason_code not in {
-            'target_video_payload_missing', 'target_not_found',
-            'target_identity_mismatch',
-        }
-    if isinstance(error, ParseException):
-        return True
-    if not isinstance(error, UpstreamException):
-        return False
-    upstream_response = error.upstream_response
-    if upstream_response is None:
-        return True
-    status = getattr(upstream_response, 'status_code', None)
-    final_url = str(getattr(upstream_response, 'url', ''))
-    return (
-        status in CFFI.retry_statuses
-        or Utils.is_control_path(final_url, 'checkpoint', 'recover')
-    )
-
-
-def _run_cookie_attempts(
-    path: str,
-    jar: CookieJar,
-) -> tuple[str, CffiResponse | None]:
-    _ensure_facebook_page_target(path)
-    if jar.is_empty():
-        with cffi.request_scope():
-            try:
-                result = _handle_facebook_path(path)
-            except Exception as exc:
-                selected_response = (
-                    cffi.selected_get_response or cffi.last_get_response
-                )
-                _attach_attempt_response(exc, selected_response)
-                raise
-            return result, cffi.selected_get_response or cffi.last_get_response
-
-    if Utils.is_share_path(path) and '3' not in request.query.getall('type'):
-        return _run_share_cookie_attempts(path, jar)
-
-    affinity_key = _cookie_scope_key(path)
-    order = jar.account_order(affinity_key)
-    for position, account_index in enumerate(order):
-        account = jar.account_at(account_index)
-        with cffi.request_scope(account):
-            try:
-                result = _handle_facebook_path(path)
-            except (NoDataException, ParseException, UpstreamException) as exc:
-                selected_response = cffi.selected_get_response or cffi.last_get_response
-                _attach_attempt_response(exc, selected_response)
-                if isinstance(exc, ShareResolutionException):
-                    exc.account_backed = True
-                    if (
-                        _is_cookie_retryable(exc)
-                        and position + 1 < len(order)
-                    ):
-                        continue
-                    raise
-                failure_affinity_key = _cookie_scope_key(cffi.affinity_path or path)
-                failure_count = _record_cookie_failure(
-                    jar, account_index, exc, failure_affinity_key
-                )
-                _maybe_notify_bad_account(jar, account_index, failure_count, exc)
-                if _is_cookie_retryable(exc) and position + 1 < len(order):
-                    continue
-                raise
-            except Exception as exc:
-                _attach_attempt_response(
-                    exc, cffi.selected_get_response or cffi.last_get_response
-                )
-                raise
-            selected_response = cffi.selected_get_response or cffi.last_get_response
-            success_affinity_key = _cookie_scope_key(cffi.affinity_path or path)
-        jar.mark_ok(account_index)
-        if success_affinity_key:
-            jar.set_affinity(success_affinity_key, account_index)
-        return result, selected_response
-
-    raise NoDataException('no accounts available')
 
 
 def _attach_attempt_response(
@@ -4336,138 +3613,16 @@ def _attach_attempt_response(
     setattr(error, 'selected_response', selected_response)
 
 
-def _run_share_cookie_attempts(
-    source_path: str,
-    jar: CookieJar,
-) -> tuple[str, CffiResponse | None]:
-    resolved_path = None
-    prefetched_response = None
-    resolution_selected_response = None
-    resolver_account_index = None
-    last_resolution_error = None
-
-    resolution_order = jar.account_order(None)
-    for resolution_position, account_index in enumerate(resolution_order):
-        account = jar.account_at(account_index)
-        with cffi.request_scope(account):
-            try:
-                candidate_path, candidate_response = Utils.resolve_share_link(
-                    source_path
-                )
-            except ShareResolutionException as exc:
-                selected_response = (
-                    cffi.selected_get_response or cffi.last_get_response
-                )
-                _attach_attempt_response(exc, selected_response)
-                exc.account_backed = True
-                last_resolution_error = exc
-                failure_count = _record_cookie_failure(
-                    jar, account_index, exc, None
-                )
-                _maybe_notify_bad_account(
-                    jar, account_index, failure_count, exc
-                )
-                if _is_cookie_retryable(exc):
-                    continue
-                raise
-            except UpstreamException as exc:
-                selected_response = (
-                    cffi.selected_get_response or cffi.last_get_response
-                )
-                _attach_attempt_response(exc, selected_response)
-                failure_count = _record_cookie_failure(
-                    jar, account_index, exc, None
-                )
-                _maybe_notify_bad_account(
-                    jar, account_index, failure_count, exc
-                )
-                if resolution_position + 1 < len(resolution_order):
-                    continue
-                raise
-            except Exception as exc:
-                _attach_attempt_response(
-                    exc, cffi.selected_get_response or cffi.last_get_response
-                )
-                raise
+def _run_request(path: str) -> tuple[str, CffiResponse | None]:
+    _ensure_facebook_page_target(path)
+    with cffi.request_scope():
+        try:
+            result = _handle_facebook_path(path)
+        except Exception as exc:
             selected_response = cffi.selected_get_response or cffi.last_get_response
-
-        resolved_path = candidate_path
-        prefetched_response = candidate_response
-        resolution_selected_response = selected_response or candidate_response
-        resolver_account_index = account_index
-        break
-
-    if resolved_path is None:
-        if last_resolution_error is not None:
-            raise last_resolution_error
-        error = ShareResolutionException('no accounts available for share resolution')
-        error.account_backed = True
-        raise error
-
-    affinity_key = _cookie_scope_key(resolved_path)
-    order = jar.account_order(affinity_key)
-    for position, account_index in enumerate(order):
-        account = jar.account_at(account_index)
-        attempt_prefetched_response = (
-            prefetched_response
-            if account_index == resolver_account_index
-            else None
-        )
-        with cffi.request_scope(account):
-            cffi.set_affinity_path(resolved_path)
-            try:
-                result = _handle_resolved_facebook_path(
-                    resolved_path,
-                    prefetched_response=attempt_prefetched_response,
-                    share_source_path=source_path,
-                )
-            except (NoDataException, ParseException, UpstreamException) as exc:
-                selected_response = (
-                    cffi.selected_get_response
-                    or cffi.last_get_response
-                    or attempt_prefetched_response
-                    or (
-                        resolution_selected_response
-                        if account_index == resolver_account_index
-                        else None
-                    )
-                )
-                _attach_attempt_response(exc, selected_response)
-                failure_count = _record_cookie_failure(
-                    jar, account_index, exc, affinity_key
-                )
-                _maybe_notify_bad_account(
-                    jar, account_index, failure_count, exc
-                )
-                if _is_cookie_retryable(exc) and position + 1 < len(order):
-                    continue
-                raise
-            except Exception as exc:
-                _attach_attempt_response(
-                    exc,
-                    cffi.selected_get_response
-                    or cffi.last_get_response
-                    or attempt_prefetched_response,
-                )
-                raise
-            selected_response = (
-                cffi.selected_get_response
-                or cffi.last_get_response
-                or attempt_prefetched_response
-                or (
-                    resolution_selected_response
-                    if account_index == resolver_account_index
-                    else None
-                )
-            )
-
-        jar.mark_ok(account_index)
-        if affinity_key:
-            jar.set_affinity(affinity_key, account_index)
-        return result, selected_response
-
-    raise NoDataException('no accounts available')
-
+            _attach_attempt_response(exc, selected_response)
+            raise
+        return result, cffi.selected_get_response or cffi.last_get_response
 
 def _handle_facebook_path(path: str) -> str:
     prefetched_response = None
@@ -4482,7 +3637,6 @@ def _handle_facebook_path(path: str) -> str:
     if Utils.is_share_path(path):
         share_source_path = path
         path, prefetched_response = Utils.resolve_share_link(path)
-        cffi.set_affinity_path(path)
 
     return _handle_resolved_facebook_path(
         path,
@@ -4521,21 +3675,12 @@ def _handle_resolved_facebook_path(
 
 @app.route('/healthz')
 def healthz():
-    jar = cookie_store.snapshot()
     uptime_secs, request_count, error_count = service_metrics.snapshot()
     payload = {
         'status': 'ok',
         'uptime_secs': uptime_secs,
         'requests': request_count,
         'errors': error_count,
-        'cookie_accounts': jar.len(),
-        'accounts': [
-            {
-                'label': account.label,
-                'in_cooldown': jar.in_cooldown(index),
-            }
-            for index, account in enumerate(jar.accounts)
-        ],
     }
     response.content_type = 'application/json'
     response.headers['Cache-Control'] = 'no-store'
@@ -4562,11 +3707,8 @@ def index(path: str):
         return format_redirect_page(f'{WWWFB}/{path}')
 
     selected_response = None
-    jar = cookie_store.snapshot()
     try:
-        result, selected_response, parser_entered = _run_tracked_cookie_attempts(
-            path, jar
-        )
+        result, selected_response, parser_entered = _run_tracked_request(path)
         if not parser_entered:
             service_metrics.record_request()
     except Exception as exc:
@@ -4623,12 +3765,6 @@ def main():
 
     parser = argparse.ArgumentParser(description='Facebook embed server')
     parser.add_argument('-c', '--config', type=str, help='config yaml file path')
-    parser.add_argument(
-        '--cookies',
-        type=Path,
-        default=Path('cookies.json'),
-        help='path to cookies.json (sibling cookies*.json files are auto-discovered)',
-    )
     args = parser.parse_args()
 
     if args.config:
@@ -4658,11 +3794,6 @@ def main():
     if sys.version_info.minor < 12:
         logging.error('python 3.12+ required, see https://docs.python.org/3.12/whatsnew/3.12.html#pep-701-syntactic-formalization-of-f-strings')
         exit(1)
-
-    loaded_jar = CookieJar.load(args.cookies)
-    cookie_store.replace(loaded_jar)
-    install_cookie_reload_handler(args.cookies)
-    start_cookie_health_check(loaded_jar)
 
     logging.info(f'listening on {config["host"]}:{config["port"]}')
     app.install(log_to_logger)

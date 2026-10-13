@@ -26,11 +26,6 @@ system installation (not recommended)
 4. Copy `user_config.example.py` to `user_config.py` and edit the self-explanatory options
 5. Start the `start.py` script
 
-## Cookies (DO NOT USE)
-Use the cookies exported using the extension Cookie Editor with the json format. Will warn 
-maintainers if any cookies expired.
-**DO NOT USE RIGHT NOW, WILL CAUSE A CHECKPOINT ON YOUR ACCOUNT**
-
 ## Start command and virtual environment
 I recommend running `facebed` in a virtual environment if you don't want to pollute your
 system-wide python installation.

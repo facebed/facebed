@@ -5,7 +5,8 @@ RUN pip3.14 install -r ./requirements.txt
 
 FROM python:3.14-alpine
 WORKDIR /facebed
-COPY . .
+COPY facebed.py ./
+COPY assets ./assets
 RUN /bin/sh -c "echo '{}' > ./config.yaml"
 COPY --from=builder /usr/local/lib/python3.14/site-packages /usr/local/lib/python3.14/site-packages
 RUN adduser -D facebed
