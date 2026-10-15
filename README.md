@@ -6,6 +6,12 @@ A Facebook embed provider for Discord and other messaging apps.
 
 ## For users:
 Replace `www.facebook.com` in your Facebook URL to `facebed.com`.
+
+Public post and group comment permalinks are supported: copy the comment's
+timestamp link, keeping `comment_id` and (for a reply) `reply_comment_id` in the
+URL. The embed shows the comment author, body, available attachment, timestamp,
+reactions and reply count. Facebook must expose the comment to logged-out
+requests; unavailable comments use the existing Facebook fallback card.
 <details>
 <summary>Vencord settings</summary>
 

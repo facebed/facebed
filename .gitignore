@@ -177,3 +177,5 @@ graph/
 fulltest/
 TOBEFIXED/
 .discord-secret
+*.jq
+research/

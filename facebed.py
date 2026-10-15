@@ -15,11 +15,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
 from functools import wraps
-from html import escape
+from html import escape, unescape
 from pathlib import Path
 from typing import Self, Callable
 from urllib.parse import quote as _quote_
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
 
 import crawleruseragents
 from curl_cffi.requests import Session as CffiSession
@@ -425,11 +425,31 @@ FACEBOOK_REACTION_NAME_IDS = {
     'sad': '908563459236466',
     'angry': '444813342392137',
 }
+def _readable_log_url(url: str) -> str:
+    def decode_percent(match):
+        try:
+            decoded = unquote(match[0], errors='strict')
+        except UnicodeDecodeError:
+            return match[0]
+        if any(
+            ord(char) < 32 or 0x7f <= ord(char) < 0xa0 or char in '\u2028\u2029'
+            for char in decoded
+        ):
+            return match[0]
+        return decoded
+
+    return re.sub(r'(?:%[0-9a-fA-F]{2})+', decode_percent, url)
+
+
 class ConsoleFormatter(logging.Formatter):
     def format(self, record):
+        formatted = re.sub(
+            r'https?://\S+', lambda match: _readable_log_url(match[0]),
+            super().format(record), flags=re.IGNORECASE,
+        )
         return re.sub(
             r'https://(?:www\.)?(?:facebook|facebed)\.com(?![\w.@:-])/*',
-            '/', super().format(record), flags=re.IGNORECASE,
+            '/', formatted, flags=re.IGNORECASE,
         )
 
 
@@ -1081,7 +1101,7 @@ class Story:
             return [one_img]
         return []
 
-    # facebook broke the original selector for all single-image posts, circa 10/12/2024
+    # facebook broke the original selector for all single-image posts around 10/12/2024
     @staticmethod
     def fallback_get_image_link(post_json: dict) -> str:
         for aa in Jq.all(post_json, 'comet_photo_attachment_resolution_renderer'):
@@ -1825,6 +1845,24 @@ class JsonParser:
                 or not (requested_id_set or selected_id_set)
             ):
                 return None
+            # A complete target-bound story can identify a reel with stale SEO tags.
+            for block in blocks:
+                for story in Jq.all(block, 'creation_story'):
+                    if not isinstance(story, dict):
+                        continue
+                    context = story.get('short_form_video_context')
+                    if not isinstance(context, dict):
+                        continue
+                    video = context.get('video')
+                    playback = context.get('playback_video')
+                    if (
+                        str(story.get('post_id', '')) == param_id
+                        and JsonParser.direct_video_identity_ids(video) == {param_id}
+                        and JsonParser.direct_video_identity_ids(playback) == {param_id}
+                        and JsonParser.direct_video_url(playback)
+                    ):
+                        return param_id
+
             if not canonical_urls or not og_urls:
                 return None
             for urls in (canonical_urls, og_urls):
@@ -2580,6 +2618,189 @@ class JsonParser:
             return ParsedPost(link_header, post_content.strip(), story.image_links, post_url, post_date,
                               likes, cmts, shares, story.video_links,
                               top_reaction_ids=tuple(top_reaction_ids))
+
+
+class CommentParser:
+    """Select one comment without borrowing content from its parent story."""
+
+    @staticmethod
+    def get_target(post_path: str) -> tuple[str, str | None] | None:
+        query = parse_qs(urlparse(post_path).query, keep_blank_values=True)
+        if not {'comment_id', 'reply_comment_id'}.intersection(query):
+            return None
+        comment = query.get('comment_id', [])
+        reply = query.get('reply_comment_id')
+        if (
+            len(comment) != 1
+            or not re.fullmatch(r'[0-9]+', comment[0])
+            or (reply is not None and (
+                len(reply) != 1 or not re.fullmatch(r'[0-9]+', reply[0])
+                or reply[0] == comment[0]
+            ))
+        ):
+            raise NoDataException(
+                'Invalid or ambiguous Facebook comment identity',
+                reason_code='invalid_comment_target', terminal=True,
+            )
+        return comment[0], reply[0] if reply is not None else None
+
+    @staticmethod
+    def comment_id(node: dict) -> str | None:
+        if not isinstance(node, dict):
+            return None
+        legacy_id = str(node.get('legacy_fbid') or '')
+        encoded = str(node.get('id') or '')
+        try:
+            decoded = base64.b64decode(
+                encoded + '=' * (-len(encoded) % 4), validate=True
+            ).decode('utf-8')
+        except (ValueError, UnicodeDecodeError):
+            decoded = ''
+        match = re.fullmatch(r'comment:[0-9]+_([0-9]+)', decoded)
+        opaque_id = match[1] if match else None
+        if legacy_id and opaque_id and legacy_id != opaque_id:
+            return None
+        if legacy_id.isascii() and legacy_id.isdigit():
+            return legacy_id
+        return opaque_id
+
+    @staticmethod
+    def select_comment(
+        blocks: list[dict], target: tuple[str, str | None], post_ids: list[str]
+    ) -> dict:
+        comment_id, reply_id = target
+        wanted_id = reply_id or comment_id
+        candidates = []
+        for block in blocks:
+            for node in Jq.enumerate(block):
+                if node.get('__typename') != 'Comment':
+                    continue
+                if CommentParser.comment_id(node) != wanted_id:
+                    continue
+                if not isinstance(node.get('author'), dict) or not (
+                    'body' in node or 'preferred_body' in node
+                ):
+                    continue
+                parent = node.get('comment_direct_parent')
+                if reply_id and isinstance(parent, dict):
+                    if CommentParser.comment_id(parent) != comment_id:
+                        continue
+                feedback = node.get('feedback')
+                urls = [node.get('url')]
+                if isinstance(feedback, dict):
+                    urls.append(feedback.get('url'))
+                for action in node.get('comment_action_links') or []:
+                    stamp = action.get('comment') if isinstance(action, dict) else None
+                    if isinstance(stamp, dict) and CommentParser.comment_id(stamp) == wanted_id:
+                        urls.append(stamp.get('url'))
+                matched_url = False
+                for url in urls:
+                    if not isinstance(url, str) or not Utils.is_facebook_url(url, require_https=True):
+                        continue
+                    try:
+                        matches = CommentParser.get_target(url) == target
+                    except NoDataException:
+                        matches = False
+                    if matches and set(JsonParser.get_requested_ids(url)).intersection(post_ids):
+                        matched_url = True
+                        break
+                if matched_url:
+                    candidates.append(node)
+        if not candidates:
+            raise NoDataException(
+                'Facebook response did not contain the requested comment',
+                reason_code='comment_payload_missing', terminal=True,
+            )
+        # Full comment renderers include attachments and feedback; timestamp and
+        # parent-reference fragments with the same ID must not shadow them.
+        return max(candidates, key=lambda node: (
+            'attachments' in node, 'preferred_body' in node,
+            isinstance(node.get('feedback'), dict), len(node),
+        ))
+
+    @staticmethod
+    def get_media(comment: dict) -> tuple[list[str], list[str]]:
+        images: list[str] = []
+        videos: list[str] = []
+        for wrapper in comment.get('attachments') or []:
+            if not isinstance(wrapper, dict):
+                continue
+            renderer = wrapper.get('style_type_renderer')
+            attachment = renderer.get('attachment') if isinstance(renderer, dict) else wrapper
+            if not isinstance(attachment, dict):
+                continue
+            media = attachment.get('media')
+            if not isinstance(media, dict):
+                continue
+            video = JsonParser.direct_video_url(media)
+            if video:
+                if video not in videos:
+                    videos.append(video)
+                continue
+            # These are direct fields of the selected attachment, never an
+            # image discovered in a reply, author avatar or parent-post subtree.
+            for key in ('animated_image', 'sticker_image', 'image', 'photo_image', 'fallback_image'):
+                image = media.get(key)
+                link = image.get('uri') if isinstance(image, dict) else None
+                if isinstance(link, str) and Utils.is_safe_media_url(link):
+                    if link not in images:
+                        images.append(link)
+                    break
+        return images, videos
+
+    @staticmethod
+    def get_counts(comment: dict) -> tuple[str, str, tuple[str, ...]]:
+        feedback = comment.get('feedback') or {}
+        reactions = feedback.get('reaction_count')
+        if isinstance(reactions, dict):
+            reactions = reactions.get('count')
+        if reactions is None:
+            reactions = (feedback.get('reactors') or {}).get('count_reduced')
+        if reactions is None:
+            reactions = (feedback.get('unified_reactors') or {}).get('count')
+        replies = feedback.get('replies_fields') or feedback.get('replies') or {}
+        reply_count = replies.get('total_count', replies.get('count'))
+        return (
+            Utils.human_format(reactions) if reactions is not None else 'null',
+            Utils.human_format(reply_count) if reply_count is not None else 'null',
+            Utils.get_top_reaction_ids(feedback),
+        )
+
+    @staticmethod
+    def process_post(post_path: str, http_response: CffiResponse | None = None) -> ParsedPost:
+        target = CommentParser.get_target(post_path)
+        if target is None:
+            raise UnsupportedRouteException('A comment permalink is required')
+        with JsonParser.fetch_page(post_path, http_response=http_response) as html_parser:
+            post_ids, _ = JsonParser.get_target_ids(html_parser, post_path)
+            comment = CommentParser.select_comment(
+                JsonParser.get_json_blocks(html_parser), target, post_ids
+            )
+            author = comment['author']
+            if not isinstance(author.get('name'), str) or not author['name']:
+                raise ParseException('Facebook comment has no author name')
+            url = JsonParser.ensure_full_url(post_path)
+            if author.get('id') in config['banned_users']:
+                return banned(url)
+            body = comment.get('body')
+            if body is None:
+                body = comment.get('preferred_body')
+            text = body.get('text', '') if isinstance(body, dict) else ''
+            images, videos = CommentParser.get_media(comment)
+            if not isinstance(text, str) or not (text.strip() or images or videos):
+                raise NoDataException(
+                    'Requested comment has no available text or media',
+                    reason_code='comment_content_unavailable', terminal=True,
+                )
+            reactions, replies, reaction_ids = CommentParser.get_counts(comment)
+            timestamp = comment.get('created_time')
+            if not isinstance(timestamp, int):
+                raise ParseException('Facebook comment has no creation timestamp')
+            return ParsedPost(
+                author['name'] + ' (💬)', text.strip(), images, url,
+                timestamp, reactions, replies, 'null', videos,
+                top_reaction_ids=reaction_ids,
+            )
 
 
 class SinglePhotoParser:
@@ -3480,6 +3701,9 @@ def _ensure_facebook_page_target(post_path: str) -> None:
 
 def _dispatch_post(post_path: str, http_response: CffiResponse | None = None) -> ParsedPost:
     _ensure_facebook_page_target(post_path)
+    if CommentParser.get_target(post_path) is not None:
+        _mark_parser_pipeline_entry()
+        return _invoke_parser(CommentParser.process_post, post_path, http_response)
     parsed_path = urlparse(post_path).path
     if Utils.is_share_path(post_path):
         _mark_parser_pipeline_entry()
@@ -3508,7 +3732,9 @@ def _dispatch_post(post_path: str, http_response: CffiResponse | None = None) ->
 def _successful_embed(parsed_post: ParsedPost) -> str:
     response.status = 200
     response.headers['Cache-Control'] = 'public, max-age=900'
-    return format_full_post_embed(parsed_post)
+    result = format_full_post_embed(parsed_post)
+    request.environ['facebed.post_title'] = parsed_post.author_name
+    return result
 
 
 def _send_dump_report(
@@ -3791,19 +4017,59 @@ def _run_request(path: str) -> tuple[str, CffiResponse | None]:
             raise
         return result, cffi.selected_get_response or cffi.last_get_response
 
+def _normalize_request_path(path: str) -> str:
+    parsed = urlparse(path)
+    route = parsed.path.strip('/')
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if route == 'story.php':
+        owners = query.get('id', [])
+        stories = query.get('story_fbid', [])
+        if (
+            len(owners) == len(stories) == 1
+            and re.fullmatch(r'[0-9]+', owners[0])
+            and re.fullmatch(r'(?:[0-9]+|pfbid[A-Za-z0-9]+)', stories[0])
+        ):
+            # Legacy story URLs can return login walls for public posts.
+            comment_query = {key: query[key] for key in ('comment_id', 'reply_comment_id') if key in query}
+            return parsed._replace(
+                path=f'/{owners[0]}/posts/{stories[0]}', query=urlencode(comment_query, doseq=True)
+            ).geturl().lstrip('/')
+    if route == 'watch' and len(query.get('v', [])) == 1:
+        video_id = re.fullmatch(r'([0-9]+)[ \t\r\n\f\v/]+', query['v'][0])
+        if video_id:
+            query['v'] = [video_id[1]]
+            return parsed._replace(query=urlencode(query, doseq=True)).geturl()
+    return path
+
+
 def _handle_facebook_path(path: str) -> str:
     prefetched_response = None
-    if '3' in request.query.getall('type'):
+    comment_target = CommentParser.get_target(path)
+    if comment_target is None and '3' in request.query.getall('type'):
         try:
             _mark_parser_pipeline_entry()
             return _successful_embed(PhotocomParser.process_post(path))
         except PARSER_FALLBACK_EXCEPTIONS:
             pass
 
+    path = _normalize_request_path(path)
     share_source_path = None
     if Utils.is_share_path(path):
         share_source_path = path
         path, prefetched_response = Utils.resolve_share_link(path)
+        if comment_target is not None:
+            resolved_target = CommentParser.get_target(path)
+            if resolved_target is not None and resolved_target != comment_target:
+                raise NoDataException(
+                    'Share resolution changed the requested comment',
+                    reason_code='comment_identity_mismatch', terminal=True,
+                )
+            parsed = urlparse(path)
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            query['comment_id'] = [comment_target[0]]
+            if comment_target[1] is not None:
+                query['reply_comment_id'] = [comment_target[1]]
+            path = parsed._replace(query=urlencode(query, doseq=True)).geturl()
 
     return _handle_resolved_facebook_path(
         path,
@@ -3821,6 +4087,8 @@ def _handle_resolved_facebook_path(
     try:
         parsed_post = _dispatch_post(path, prefetched_response)
     except ROUTE_FALLBACK_EXCEPTIONS as primary_error:
+        if CommentParser.get_target(path) is not None:
+            raise
         if not _allow_route_upstream_fallback(primary_error):
             raise
         if share_source_path and share_source_path != path:
@@ -3919,11 +4187,30 @@ def root():
         return f.read().replace('{|CREDIT|}', get_credit())
 
 
+def _readable_log_title(title: str) -> str:
+    def decode_unicode(match):
+        value = match[0]
+        try:
+            decoded = chr(int(value[2:], 16)) if value.startswith('\\U') else json.loads(f'"{value}"')
+        except ValueError:
+            return value
+        if any(ord(char) < 32 or 0x7f <= ord(char) < 0xa0 or 0xd800 <= ord(char) <= 0xdfff for char in decoded):
+            return value
+        return decoded
+
+    title = re.sub(r'(?:\\u[0-9a-fA-F]{4})+|\\U[0-9a-fA-F]{8}', decode_unicode, unescape(title))
+    return ' '.join(unescape(title).split())
+
+
 def log_to_logger(fn):
     @wraps(fn)
     def _log_to_logger(*argsz, **kwargs):
         actual_response = fn(*argsz, **kwargs)
-        logging.info('%s %s %s %s', request.remote_addr, request.method, request.url, response.status)
+        title = _readable_log_title(request.environ.get('facebed.post_title', ''))
+        logging.info(
+            '%s %s %s %s%s', request.remote_addr, request.method,
+            request.url, response.status, f' {title}' if title else '',
+        )
         return actual_response
 
     return _log_to_logger
