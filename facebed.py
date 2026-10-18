@@ -1355,6 +1355,10 @@ class JsonParser:
         if videos_index is None:
             return None
         video_parts = parts[videos_index + 1:]
+        if video_parts and re.fullmatch(
+            r'&sa=U&ved=[A-Za-z0-9_-]+&usg=[A-Za-z0-9_-]+', video_parts[-1]
+        ):
+            video_parts = video_parts[:-1]
         if (
             len(video_parts) not in {1, 2}
             or not video_parts[-1].isdigit()
@@ -1461,6 +1465,27 @@ class JsonParser:
                     story = title.get('story') if isinstance(title, dict) else None
                     post_id = story.get('post_id') if isinstance(story, dict) else None
                     if isinstance(post_id, (str, int)) and str(post_id) in raw_ids:
+                        return True
+            return False
+
+        def reel_links_source_to_target(candidate_id: str) -> bool:
+            if len(set(raw_ids)) != 1:
+                return False
+            for block in blocks:
+                for story in Jq.all(block, 'creation_story'):
+                    if not isinstance(story, dict):
+                        continue
+                    context = story.get('short_form_video_context')
+                    if not isinstance(context, dict):
+                        continue
+                    if (
+                        str(story.get('post_id', '')) in raw_ids
+                        and JsonParser.direct_video_identity_ids(context.get('video'))
+                        == {candidate_id}
+                        and JsonParser.direct_video_identity_ids(context.get('playback_video'))
+                        == {candidate_id}
+                        and JsonParser.direct_video_url(context.get('playback_video'))
+                    ):
                         return True
             return False
 
@@ -1602,16 +1627,29 @@ class JsonParser:
                 and response_was_redirected
                 and redirect_provenance_matches_source()
                 and Utils.is_facebook_url(response_url, require_https=True)
-                and '/videos/' in urlparse(response_url).path.lower()
-                and route_name
-                == 'comet.fbweb.CometVideoHomeLOEVideoPermalinkRoute'
+                and (
+                    (
+                        '/videos/' in urlparse(response_url).path.lower()
+                        and route_name == 'comet.fbweb.CometVideoHomeLOEVideoPermalinkRoute'
+                    )
+                    or (
+                        '/reel/' in urlparse(response_url).path.lower()
+                        and route_name == 'comet.fbweb.CometFBReelsRoute'
+                    )
+                )
                 and declared_final_target
                 and JsonParser.has_target_video_delivery(
                     blocks, [str(final_video_id)]
                 )
                 and (
-                    raw_ids_are_pfbids
-                    or media_links_source_to_target(str(final_video_id))
+                    (
+                        route_name == 'comet.fbweb.CometVideoHomeLOEVideoPermalinkRoute'
+                        and (raw_ids_are_pfbids or media_links_source_to_target(str(final_video_id)))
+                    )
+                    or (
+                        route_name == 'comet.fbweb.CometFBReelsRoute'
+                        and reel_links_source_to_target(str(final_video_id))
+                    )
                 )
             )
             if not (
@@ -1837,7 +1875,7 @@ class JsonParser:
             )
             if len(route_ids) != 1 or not param_id or route_ids != {param_id}:
                 return None
-            requested_id_set = set(raw_ids)
+            requested_id_set = set(target_ids)  # Honor aliases proved by get_target_ids.
             selected_id_set = set(JsonParser.get_requested_ids(response_url))
             if (
                 (requested_id_set and requested_id_set != {param_id})
@@ -2490,6 +2528,10 @@ class JsonParser:
                 )
                 if Utils.facebook_path_segments(selected_url):
                     effective_post_path = selected_url
+                    if urlparse(selected_url).path.startswith('/reel/'):
+                        return ReelsParser.process_post(
+                            selected_url, http_response=cffi.selected_get_response
+                        )
             if Utils.is_share_path(post_path) and not raw_ids and not route_proven_ids:
                 raise NoDataException(
                     'Facebook response did not identify the requested share post'
