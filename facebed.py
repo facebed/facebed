@@ -1395,7 +1395,7 @@ class JsonParser:
 
         for pattern in (
             r'/reel/([^/?]+)',
-            r'/watch/([^/?]+)',
+            r'/watch/(?!live/?$)([^/?]+)',
             r'(?<!share)/v/(\d+)(?:/|$)',
             r'/permalink/([^/?]+)',
             r'/photos/(?:[^/]+/)?([^/?]+)/?$',
@@ -1496,6 +1496,19 @@ class JsonParser:
                 for url in urls
             )
 
+        def is_post_alias_source(value: str) -> bool:
+            parsed = urlparse(JsonParser.ensure_full_url(value))
+            if '/posts/' in parsed.path.lower():
+                return True
+            if parsed.path.lower() not in {'/story.php', '/permalink.php'}:
+                return False
+            story_ids = parse_qs(parsed.query, keep_blank_values=True).get('story_fbid', [])
+            return bool(
+                len(story_ids) == 1
+                and re.fullmatch(r'[0-9]+', story_ids[0])
+                and set(JsonParser.get_requested_ids(value)) == {story_ids[0]}
+            )
+
         def redirect_provenance_matches_source() -> bool:
             if (
                 selected_response is None
@@ -1509,7 +1522,7 @@ class JsonParser:
             )
             return bool(
                 Utils.is_facebook_url(first_hop_url, require_https=True)
-                and '/posts/' in urlparse(first_hop_url).path.lower()
+                and is_post_alias_source(first_hop_url)
                 and set(raw_ids).intersection(
                     JsonParser.get_requested_ids(first_hop_url)
                 )
@@ -1621,9 +1634,7 @@ class JsonParser:
             post_to_video_alias = bool(
                 not source_is_share
                 and raw_ids
-                and '/posts/' in urlparse(
-                    JsonParser.ensure_full_url(post_path)
-                ).path.lower()
+                and is_post_alias_source(post_path)
                 and response_was_redirected
                 and redirect_provenance_matches_source()
                 and Utils.is_facebook_url(response_url, require_https=True)
@@ -4077,9 +4088,9 @@ def _normalize_request_path(path: str) -> str:
                 path=f'/{owners[0]}/posts/{stories[0]}', query=urlencode(comment_query, doseq=True)
             ).geturl().lstrip('/')
     if route == 'watch' and len(query.get('v', [])) == 1:
-        video_id = re.fullmatch(r'([0-9]+)[ \t\r\n\f\v/]+', query['v'][0])
+        video_id = re.fullmatch(r'(?:([0-9]+)[ \t\r\n\f\v/]+|/([0-9]+)/)', query['v'][0])
         if video_id:
-            query['v'] = [video_id[1]]
+            query['v'] = [video_id[1] or video_id[2]]
             return parsed._replace(query=urlencode(query, doseq=True)).geturl()
     return path
 
